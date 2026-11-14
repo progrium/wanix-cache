@@ -74,6 +74,13 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 			return nil, err
 		}
 	}
+	if level, err := compression(bdir); err != nil {
+		return nil, err
+	} else if level > 0 {
+		if storage, err = newZstd(storage, level); err != nil {
+			return nil, err
+		}
+	}
 	q := &quotaStore{Storage: storage, max: maxBytes}
 	err = blobserver.EnumerateAll(context.Background(), storage, func(sr blob.SizedRef) error {
 		q.used += int64(sr.Size)

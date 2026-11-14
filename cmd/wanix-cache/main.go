@@ -1,6 +1,6 @@
 // Command wanix-cache is the H9 read-through cache.
 //
-//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR] [-debug-shadow] [-pack-small N]
+//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR] [-debug-shadow] [-pack-small N] [-zstd L]
 //	wanix-cache import [-data DIR] [-max-gib N] -key NAME SRC
 //	wanix-cache index  [-data DIR] [-all] [ROOT...]
 //	wanix-cache stats  [-data DIR] [-json] [-n N]
@@ -74,11 +74,17 @@ func main() {
 		gib := fl.Int64("max-gib", 10, "cap on CAS + spool bytes, GiB; 0 = unlimited")
 		workers := fl.Int("ingest-workers", 4, "files ingested into the CAS concurrently")
 		pack := fl.Int("pack-small", 0, "experimental: from now on store blobs of at most this many bytes in pack files (Perkeep diskpacked) instead of one file each; stays on once set. With it, stop the server before stats, gc or audit")
+		zst := fl.Int("zstd", 0, "experimental: compress every blob with zstd at this level (1 fastest to 4 best); only on a new, empty cache, and stays on")
 		shadow := fl.Bool("debug-shadow", false, "debug savings mode: also keep every resident unit unpacked on plain disk under DATA/shadow, for /.cache/stats and `stats` (not counted by -max-gib)")
 		addSubsystemFlags(fl)
 		fl.Parse(args)
 		if *pack > 0 {
 			if err := cas.EnablePacking(*data, *pack); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if *zst > 0 {
+			if err := cas.EnableCompression(*data, *zst); err != nil {
 				log.Fatal(err)
 			}
 		}

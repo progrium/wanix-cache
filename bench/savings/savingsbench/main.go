@@ -10,6 +10,8 @@
 //	savingsbench settle  -data DIR [-quiet 5s]
 //	savingsbench b3      -shadow DIR [-link]
 //	savingsbench variants -data DIR
+//	savingsbench zlinks  -shadow DIR -out DIR [-level 2]
+//	savingsbench readall -mode dir|zlinks|cas -root DIR [-j N] [-cold]
 //
 // See bench/savings/README.md for how a run fits together.
 package main
@@ -39,6 +41,7 @@ import (
 	"9fans.net/go/plan9/client"
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/meta"
 )
 
@@ -83,6 +86,19 @@ func main() {
 		data := fl.String("data", "", "cache directory")
 		fl.Parse(args)
 		err = variants(*data)
+	case "zlinks":
+		shadow := fl.String("shadow", "", "plain tree to convert (B2 or B3)")
+		out := fl.String("out", "", "new directory: objects/ and tree/")
+		level := fl.Int("level", 2, "zstd encoder level (1 to 4)")
+		fl.Parse(args)
+		err = zlinks(*shadow, *out, *level)
+	case "readall":
+		mode := fl.String("mode", "dir", "dir (plain files), zlinks (zlinks tree), cas (a cache's resident files)")
+		root := fl.String("root", "", "the tree (dir, zlinks) or cache directory (cas)")
+		par := fl.Int("j", 1, "files read concurrently")
+		cold := fl.Bool("cold", false, "sync and drop the kernel caches first (root)")
+		fl.Parse(args)
+		err = readAll(*mode, *root, *par, *cold)
 	default:
 		log.Fatalf("savingsbench: unknown command %q", cmd)
 	}
@@ -691,4 +707,245 @@ func variants(dir string) error {
 
 func isSchema(b []byte) bool {
 	return len(b) > 0 && b[0] == '{' && strings.Contains(string(b[:min(len(b), 64)]), `"camliVersion"`)
+}
+
+// ---------------------------------------------------------------- zlinks
+
+// zlinks builds the hard-link alternative to the CAS with compression: each
+// distinct file stored once as objects/<sha256>, one header byte (0 raw,
+// 1 zstd) then the bytes, and tree/ mirroring the shadow with every file a
+// hard link to its object. It prints the allocated size of the result.
+func zlinks(shadow, out string, level int) error {
+	if shadow == "" || out == "" {
+		return errors.New("zlinks: -shadow and -out are required")
+	}
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevel(level)), zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		return err
+	}
+	objs, tree := filepath.Join(out, "objects"), filepath.Join(out, "tree")
+	if err := os.MkdirAll(objs, 0o755); err != nil {
+		return err
+	}
+	byIno := map[uint64]string{}
+	var files, objects, raw int64
+	start := time.Now()
+	err = filepath.WalkDir(shadow, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(shadow, p)
+		dst := filepath.Join(tree, rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(dst, 0o755)
+		case info.Mode()&fs.ModeSymlink != 0:
+			t, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(t, dst)
+		case !info.Mode().IsRegular():
+			return nil
+		}
+		files++
+		ino := info.Sys().(*syscall.Stat_t).Ino
+		obj, ok := byIno[ino]
+		if !ok {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			sum := sha256.Sum256(b)
+			obj = filepath.Join(objs, fmt.Sprintf("%x", sum))
+			if _, err := os.Lstat(obj); errors.Is(err, fs.ErrNotExist) {
+				z := enc.EncodeAll(b, []byte{1})
+				if len(z) >= len(b)+1 {
+					z = append([]byte{0}, b...)
+				}
+				if err := os.WriteFile(obj, z, 0o444); err != nil {
+					return err
+				}
+				objects++
+				raw += int64(len(b))
+			}
+			byIno[ino] = obj
+		}
+		return os.Link(obj, dst)
+	})
+	if err != nil {
+		return err
+	}
+	a, err := allocated(out)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"files": files, "objects": objects, "object_logical": raw, "allocated": a,
+		"seconds": time.Since(start).Seconds(),
+	})
+}
+
+// allocated sums st_blocks × 512 over the distinct inodes under dir.
+func allocated(dir string) (int64, error) {
+	seen := map[uint64]bool{}
+	var n int64
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		st := info.Sys().(*syscall.Stat_t)
+		if !seen[st.Ino] {
+			seen[st.Ino] = true
+			n += st.Blocks * 512
+		}
+		return nil
+	})
+	return n, err
+}
+
+// ---------------------------------------------------------------- readall
+
+// readAll reads every file whole in 128 KiB reads, directly (no 9P), and
+// prints the throughput: plain files, zlinks files (decompressed), or a
+// cache's resident file inodes through cas.Store.Open.
+func readAll(mode, root string, par int, cold bool) error {
+	type item struct {
+		path string
+		ref  string
+		size int64
+	}
+	var items []item
+	var store *cas.Store
+	switch mode {
+	case "dir", "zlinks":
+		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.Type().IsRegular() {
+				items = append(items, item{path: p})
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	case "cas":
+		db, err := meta.Open(filepath.Join(root, "meta.db"))
+		if err != nil {
+			return err
+		}
+		rows, err := db.SQL().Query(`SELECT i.content, i.size FROM inode i JOIN unit u ON u.id = i.unit
+			WHERE i.kind = ? AND u.state = ? AND i.content != '' ORDER BY i.ino`, meta.KindFile, meta.UnitResident)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var it item
+			if err := rows.Scan(&it.ref, &it.size); err != nil {
+				return err
+			}
+			items = append(items, it)
+		}
+		rows.Close()
+		db.Close()
+		if store, err = cas.Open(root, 0); err != nil {
+			return err
+		}
+		defer store.Close()
+	default:
+		return fmt.Errorf("readall: unknown mode %q", mode)
+	}
+	if cold {
+		syscall.Sync()
+		if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("3\n"), 0); err != nil {
+			return fmt.Errorf("readall: drop caches: %w", err)
+		}
+	}
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return err
+	}
+	defer dec.Close()
+	ctx := context.Background()
+	var bytes atomic.Int64
+	work := make(chan item, 256)
+	var wg sync.WaitGroup
+	var firstErr atomic.Value
+	start := time.Now()
+	for range par {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 128<<10)
+			for it := range work {
+				n, err := func() (int64, error) {
+					switch mode {
+					case "dir":
+						f, err := os.Open(it.path)
+						if err != nil {
+							return 0, err
+						}
+						defer f.Close()
+						return io.CopyBuffer(io.Discard, struct{ io.Reader }{f}, buf)
+					case "zlinks":
+						b, err := os.ReadFile(it.path)
+						if err != nil || len(b) == 0 {
+							return 0, err
+						}
+						if b[0] == 0 {
+							return int64(len(b) - 1), nil
+						}
+						d, err := dec.DecodeAll(b[1:], nil)
+						return int64(len(d)), err
+					default:
+						f, err := store.Open(ctx, it.ref)
+						if err != nil {
+							return 0, err
+						}
+						defer f.Close()
+						var off int64
+						for off < it.size {
+							k, err := f.ReadAt(buf, off)
+							off += int64(k)
+							if err == io.EOF {
+								break
+							}
+							if err != nil {
+								return off, err
+							}
+						}
+						return off, nil
+					}
+				}()
+				if err != nil {
+					firstErr.CompareAndSwap(nil, fmt.Errorf("%s%s: %w", it.path, it.ref, err))
+				}
+				bytes.Add(n)
+			}
+		}()
+	}
+	for _, it := range items {
+		work <- it
+	}
+	close(work)
+	wg.Wait()
+	if e, ok := firstErr.Load().(error); ok && e != nil {
+		return e
+	}
+	el := time.Since(start).Seconds()
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"mode": mode, "root": root, "j": par, "cold": cold, "files": len(items),
+		"bytes": bytes.Load(), "seconds": el, "mib_s": float64(bytes.Load()) / (1 << 20) / el,
+		"files_s": float64(len(items)) / el,
+	})
 }

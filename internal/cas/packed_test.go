@@ -14,6 +14,9 @@ import (
 // store tests run again over the split store.
 var packTests int
 
+// zstdTests, when set, turns per-blob zstd on in openStore at that level.
+var zstdTests int
+
 func openStore(t *testing.T, quota int64) (*Store, error) {
 	dir := t.TempDir()
 	if packTests > 0 {
@@ -21,7 +24,66 @@ func openStore(t *testing.T, quota int64) (*Store, error) {
 			t.Fatal(err)
 		}
 	}
+	if zstdTests > 0 {
+		if err := EnableCompression(dir, zstdTests); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return Open(dir, quota)
+}
+
+func TestZstd(t *testing.T) {
+	zstdTests = 2
+	defer func() { zstdTests = 0 }()
+	t.Run("PutDeterministicAndDeduped", TestPutDeterministicAndDeduped)
+	t.Run("BlobsRemoveAndHolds", TestBlobsRemoveAndHolds)
+	t.Run("ReclaimerBeforeFull", TestReclaimerBeforeFull)
+	t.Run("CancelledStatsDoNotWedge", TestCancelledStatsDoNotWedge)
+	t.Run("Compressible", testCompressible)
+	packTests = 16 << 10
+	defer func() { packTests = 0 }()
+	t.Run("Packed", TestPutDeterministicAndDeduped)
+	t.Run("PackedCompressible", testCompressible)
+}
+
+func testCompressible(t *testing.T) {
+	ctx := context.Background()
+	s, err := openStore(t, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	data := bytes.Repeat([]byte("wanix-cache compresses this line\n"), 100_000) // 3.3 MB
+	ref, err := s.Put(ctx, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used, _ := s.Usage(); used > int64(len(data))/20 {
+		t.Errorf("stored %d bytes for %d compressible bytes", used, len(data))
+	}
+	f, err := s.Open(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	got, err := io.ReadAll(io.NewSectionReader(f, 0, int64(len(data))))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("read back %d bytes, %v", len(got), err)
+	}
+}
+
+func TestZstdNeedsEmptyStore(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(context.Background(), bytes.NewReader([]byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnableCompression(dir, 2); err == nil {
+		t.Fatal("zstd turned on for a store that holds blobs")
+	}
 }
 
 func TestPacked(t *testing.T) {
