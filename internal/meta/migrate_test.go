@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMigrate(t *testing.T) {
@@ -70,5 +71,51 @@ func TestWhiteoutAndFlags(t *testing.T) {
 	dir, _ := db.Get(ctx, d)
 	if dir.Flags&FlagOpaque == 0 {
 		t.Fatal("opaque flag not stored")
+	}
+}
+
+// A cache made with the CAS keeps its manifests: resident units become
+// evicted with their content cleared, so they refault into the file store.
+func TestMigrateFromCAS(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "meta.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, _ := db.Begin(ctx)
+	id, _ := tx.CreateUnit("local", "a")
+	root, _ := tx.MkdirAll("/local/a")
+	ino, err := tx.File(root, "f", 0o644, 3, time.Unix(0, 0), "sha224-cafe", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.RefContent("sha256-beef", 3)
+	tx.SetUnitState(id, UnitAbsent, UnitFetching)
+	tx.SetUnitState(id, UnitFetching, UnitSpooled)
+	tx.SetUnitState(id, UnitSpooled, UnitResident)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Back to the CAS schema version.
+	if _, err := db.db.Exec(`DELETE FROM schema_migrations WHERE owner = 'core' AND version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	if db, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	u, err := db.UnitByID(ctx, id)
+	if err != nil || u.State != UnitEvicted {
+		t.Fatalf("unit %+v, %v; want evicted", u, err)
+	}
+	in, err := db.Get(ctx, ino)
+	if err != nil || in.Content != "" || in.Size != 3 {
+		t.Fatalf("inode %+v, %v; want the manifest kept with no content", in, err)
+	}
+	if s, _ := db.Stats(ctx); s.Contents != 0 {
+		t.Errorf("%d content rows left", s.Contents)
 	}
 }

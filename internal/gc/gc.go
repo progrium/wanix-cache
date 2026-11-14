@@ -1,32 +1,26 @@
-// Package gc evicts units and frees the CAS blobs nobody references.
+// Package gc evicts units to keep the cache under its cap.
 //
-// Refcounts are kept at two levels, both global with no subsystem column, so
-// a blob shared by an apk and an OCI layer is freed only when the last
-// reference anywhere is gone:
+// Each resident file is a plain file in the store, and identical files are
+// hard links to one inode, so the filesystem's link count is the refcount
+// of the bytes: evicting a unit removes its store directory, and a file's
+// blocks are freed when its last link goes, whichever unit or subsystem
+// that link was in.
 //
-//	content.refs   file inodes of resident units that use a content object
-//	               (maintained by ingest through meta.Tx.RefContent)
-//	gc_blob.refs   content objects that use a blob (maintained here)
+// The metadata keeps content.refs, the file inodes of resident units that
+// use each content digest (maintained by ingest through
+// meta.Tx.RefContent), so the GC can tell before evicting a unit how many
+// bytes that would free: the contents only that unit uses.
 //
 // Evicting a unit moves it resident -> evicted, drops its inodes' content
-// refs, drops a content object whose refs reach zero, and dooms the blobs
-// that object leaves at zero. The unit's manifest (inodes, dirents, sizes)
-// stays with each file's content cleared, so a later read refaults the unit
-// through the fill path into the same inodes. A sweep deletes doomed
-// blobs through the blobserver; Perkeep has no GC of its own.
-//
-// Ingest never talks to this package. It records content with
-// RefContent as before and puts blobs through a cas.Session that it closes
-// after committing. The GC finds content rows it has not seen yet (they
-// have no gc_content_blob rows), walks their schemas and counts their
-// blobs ("backfill") before every reclaim, sweep and audit. A blob that was
-// doomed and is now used by new content is revived by that backfill, and
-// the session's hold keeps a sweep from deleting it in between.
+// refs (and content rows that reach zero), and then removes its files. The
+// unit's manifest (inodes, dirents, sizes) stays with each file's content
+// cleared, so a later read refaults the unit through the fill path into
+// the same inodes.
 //
 // Victims are chosen least recently used first among resident units that
 // are not pinned. A unit whose eviction would free no bytes (everything it
 // holds is shared) is passed over while some unit would free bytes, then
-// taken in LRU order, since evicting it can make its sharers' blobs
+// taken in LRU order, since evicting it can make its sharers' files
 // exclusive.
 package gc
 
@@ -35,13 +29,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
@@ -53,16 +46,16 @@ var (
 )
 
 // Config tunes a Collector. The zero value works: no cap (so no watermark
-// eviction), CAS bytes as usage, and no hooks.
+// eviction), stored bytes as usage, and no hooks.
 type Config struct {
-	// Max is the cache cap in bytes. 0 uses the CAS store's quota.
+	// Max is the cache cap in bytes. 0 means no cap.
 	Max int64
 	// High and Low are the watermarks, as fractions of Max: when usage goes
 	// over High, units are evicted until it is under Low. Defaults 0.95 and
 	// 0.85.
 	High, Low float64
-	// Usage returns the accounted bytes (fill.Quota's CAS + spool +
-	// reserved). Defaults to the CAS store's unique blob bytes.
+	// Usage returns the accounted bytes (fill.Quota's store + spool +
+	// reserved). Defaults to the store's bytes.
 	Usage func() int64
 	// Pinned reports in-memory pins held elsewhere, normally
 	// fill.Manager.Pinned (open handles, fills, views). Pins taken with
@@ -80,26 +73,23 @@ type Config struct {
 	Logf func(format string, args ...any)
 }
 
-// Collector is the eviction policy and blob GC. It implements
-// fill.Reclaimer. It is safe for concurrent use; evictions, sweeps and
-// audits run one at a time.
+// Collector is the eviction policy. It implements fill.Reclaimer. It is
+// safe for concurrent use; evictions and audits run one at a time.
 type Collector struct {
 	db    *meta.DB
 	sql   *sql.DB
-	store *cas.Store
+	store *store.Store
 	cfg   Config
 	pins  fill.Pins
 	kick  chan struct{}
 
-	mu sync.Mutex // serializes everything that changes refcounts or deletes blobs
+	mu sync.Mutex // serializes everything that changes refcounts or deletes files
 }
 
 var _ fill.Reclaimer = (*Collector)(nil)
 
-// New applies the GC's migrations and returns a collector. It installs
-// itself as the store's reclaimer, so a CAS write that would exceed the
-// store's quota evicts before it fails.
-func New(ctx context.Context, db *meta.DB, store *cas.Store, cfg Config) (*Collector, error) {
+// New applies the GC's migrations and returns a collector.
+func New(ctx context.Context, db *meta.DB, st *store.Store, cfg Config) (*Collector, error) {
 	if err := db.Migrate(ctx, Owner, Migrations); err != nil {
 		return nil, err
 	}
@@ -118,8 +108,7 @@ func New(ctx context.Context, db *meta.DB, store *cas.Store, cfg Config) (*Colle
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	c := &Collector{db: db, sql: db.SQL(), store: store, cfg: cfg, kick: make(chan struct{}, 1)}
-	store.SetReclaimer(c.Reclaim)
+	c := &Collector{db: db, sql: db.SQL(), store: st, cfg: cfg, kick: make(chan struct{}, 1)}
 	return c, nil
 }
 
@@ -142,20 +131,13 @@ func (c *Collector) Attach(m fill.Manager) {
 }
 
 // Max returns the cap the watermarks apply to; 0 means none.
-func (c *Collector) Max() int64 {
-	if c.cfg.Max > 0 {
-		return c.cfg.Max
-	}
-	_, max := c.store.Usage()
-	return max
-}
+func (c *Collector) Max() int64 { return c.cfg.Max }
 
 func (c *Collector) usage() int64 {
 	if c.cfg.Usage != nil {
 		return c.cfg.Usage()
 	}
-	used, _ := c.store.Usage()
-	return used
+	return c.store.Used()
 }
 
 // Acquire pins a unit in memory until release is called.
@@ -186,41 +168,29 @@ func (c *Collector) Run(ctx context.Context) error {
 	}
 }
 
-// Collect sweeps doomed blobs and, if usage is over the high watermark,
-// evicts down to the low one. It returns the bytes freed.
+// Collect evicts down to the low watermark if usage is over the high one.
+// It returns the bytes freed.
 func (c *Collector) Collect(ctx context.Context) (int64, error) {
-	sw, err := c.Sweep(ctx)
-	if err != nil {
-		return 0, err
-	}
 	max := c.Max()
 	if max <= 0 {
-		return sw.Bytes, nil
+		return 0, nil
 	}
 	used := c.usage()
 	if float64(used) <= c.cfg.High*float64(max) {
-		return sw.Bytes, nil
+		return 0, nil
 	}
 	need := used - int64(c.cfg.Low*float64(max))
-	freed, err := c.Reclaim(ctx, need)
-	return sw.Bytes + freed, err
+	return c.Reclaim(ctx, need)
 }
 
-// Reclaim evicts unpinned units, least recently used first, and sweeps
-// their blobs until at least need bytes are freed or nothing evictable
-// remains. It returns the bytes actually freed, which can be less than need
-// without an error; the caller decides whether that is a failure.
+// Reclaim evicts unpinned units, least recently used first, until at
+// least need bytes are freed or nothing evictable remains. It returns the
+// bytes actually freed, which can be less than need without an error; the
+// caller decides whether that is a failure.
 func (c *Collector) Reclaim(ctx context.Context, need int64) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, err := c.backfill(ctx); err != nil {
-		return 0, err
-	}
-	sw, err := c.sweep(ctx)
-	if err != nil {
-		return 0, err
-	}
-	freed := sw.Bytes
+	var freed int64
 	skip := map[int64]bool{}     // vetoed by a hook or pinned mid-way
 	deferred := map[int64]bool{} // held back by a subsystem's EvictionOrder
 	exclude := func(id int64) bool { return skip[id] || deferred[id] }
@@ -249,7 +219,7 @@ func (c *Collector) Reclaim(ctx context.Context, need int64) (int64, error) {
 			if ex == 0 {
 				continue
 			}
-			n, ok, err := c.evictAndSweep(ctx, u, skip)
+			n, ok, err := c.evictFree(ctx, u, skip)
 			if err != nil {
 				return freed, err
 			}
@@ -261,8 +231,8 @@ func (c *Collector) Reclaim(ctx context.Context, need int64) (int64, error) {
 		}
 		if !progress {
 			// Everything in the window is shared. Evict the oldest so its
-			// sharers' blobs can become exclusive.
-			n, ok, err := c.evictAndSweep(ctx, window[0], skip)
+			// sharers' files can become exclusive.
+			n, ok, err := c.evictFree(ctx, window[0], skip)
 			if err != nil {
 				return freed, err
 			}
@@ -348,36 +318,29 @@ func (c *Collector) order(ctx context.Context, window []meta.Unit, deferred map[
 	return out
 }
 
-func (c *Collector) evictAndSweep(ctx context.Context, u meta.Unit, skip map[int64]bool) (freed int64, evicted bool, err error) {
-	if err := c.evict(ctx, u); err != nil {
+func (c *Collector) evictFree(ctx context.Context, u meta.Unit, skip map[int64]bool) (freed int64, evicted bool, err error) {
+	freed, err = c.evict(ctx, u)
+	if err != nil {
 		if errors.Is(err, ErrPinned) || errors.Is(err, ErrNotResident) || errors.Is(err, errVetoed) {
 			c.cfg.Logf("gc: skip %s/%s: %v", u.Subsystem, u.Key, err)
 			skip[u.ID] = true
 			return 0, false, nil
 		}
-		return 0, false, err
+		return freed, false, err
 	}
-	sw, err := c.sweep(ctx)
-	return sw.Bytes, true, err
+	return freed, true, nil
 }
 
-// Evict evicts one unit now, whatever the watermarks say, and sweeps. It
-// fails with ErrPinned or ErrNotResident, or with the subsystem hook's error.
+// Evict evicts one unit now, whatever the watermarks say. It fails with
+// ErrPinned or ErrNotResident, or with the subsystem hook's error.
 func (c *Collector) Evict(ctx context.Context, unitID int64) (freed int64, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, err := c.backfill(ctx); err != nil {
-		return 0, err
-	}
 	u, err := c.unit(ctx, unitID)
 	if err != nil {
 		return 0, err
 	}
-	if err := c.evict(ctx, u); err != nil {
-		return 0, err
-	}
-	sw, err := c.sweep(ctx)
-	return sw.Bytes, err
+	return c.evict(ctx, u)
 }
 
 func (c *Collector) unit(ctx context.Context, id int64) (meta.Unit, error) {
@@ -447,46 +410,41 @@ func (c *Collector) candidates(ctx context.Context, n int, exclude func(int64) b
 }
 
 // Exclusive returns the bytes evicting unit id would free now: the sizes of
-// blobs used only by content that only this unit uses.
+// the contents only this unit uses.
 func (c *Collector) Exclusive(ctx context.Context, id int64) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, err := c.backfill(ctx); err != nil {
-		return 0, err
-	}
 	return c.exclusive(ctx, id)
 }
 
 func (c *Collector) exclusive(ctx context.Context, id int64) (int64, error) {
 	var n int64
 	err := c.sql.QueryRowContext(ctx, `
-		WITH uc AS (SELECT content AS ref, count(*) AS n FROM inode
-		            WHERE unit = ? AND kind = ? AND content != '' GROUP BY content),
-		     dc AS (SELECT uc.ref FROM uc JOIN content c ON c.ref = uc.ref WHERE c.refs <= uc.n),
-		     bc AS (SELECT cb.blob, count(*) AS n FROM gc_content_blob cb JOIN dc ON dc.ref = cb.content GROUP BY cb.blob)
-		SELECT coalesce(sum(b.size), 0) FROM bc JOIN gc_blob b ON b.ref = bc.blob WHERE b.refs <= bc.n`,
+		WITH uc AS (SELECT content AS digest, count(*) AS n FROM inode
+		            WHERE unit = ? AND kind = ? AND content != '' GROUP BY content)
+		SELECT coalesce(sum(c.size), 0) FROM uc JOIN content c ON c.digest = uc.digest WHERE c.refs <= uc.n`,
 		id, meta.KindFile).Scan(&n)
 	return n, err
 }
 
 var errVetoed = errors.New("gc: eviction vetoed by subsystem")
 
-// evict moves one unit resident -> evicted and drops its references. Its
-// blobs are only doomed; the caller sweeps.
-func (c *Collector) evict(ctx context.Context, u meta.Unit) error {
+// evict moves one unit resident -> evicted, drops its references, and
+// removes its files. It returns the bytes that freed.
+func (c *Collector) evict(ctx context.Context, u meta.Unit) (int64, error) {
 	if u.State != meta.UnitResident {
-		return fmt.Errorf("%w: %s/%s is %v", ErrNotResident, u.Subsystem, u.Key, u.State)
+		return 0, fmt.Errorf("%w: %s/%s is %v", ErrNotResident, u.Subsystem, u.Key, u.State)
 	}
 	if p, err := c.pinned(ctx, c.sql, u.ID); err != nil {
-		return err
+		return 0, err
 	} else if p {
-		return fmt.Errorf("%w: %s/%s", ErrPinned, u.Subsystem, u.Key)
+		return 0, fmt.Errorf("%w: %s/%s", ErrPinned, u.Subsystem, u.Key)
 	}
 	if c.cfg.Subsystem != nil {
 		if s, ok := c.cfg.Subsystem(u.Subsystem); ok {
 			if e, ok := s.(subsys.Evicter); ok {
 				if err := e.OnEvict(ctx, subsys.Key(u.Key)); err != nil {
-					return fmt.Errorf("%w: %s/%s: %v", errVetoed, u.Subsystem, u.Key, err)
+					return 0, fmt.Errorf("%w: %s/%s: %v", errVetoed, u.Subsystem, u.Key, err)
 				}
 			}
 		}
@@ -503,9 +461,8 @@ func (c *Collector) evict(ctx context.Context, u meta.Unit) error {
 		if err != nil {
 			return err
 		}
-		now := time.Now().UnixNano()
-		for ref, n := range refs {
-			if err := unrefContent(ctx, q, ref, n, now); err != nil {
+		for digest, n := range refs {
+			if err := unrefContent(ctx, q, digest, n); err != nil {
 				return err
 			}
 		}
@@ -517,7 +474,7 @@ func (c *Collector) evict(ctx context.Context, u meta.Unit) error {
 		}
 		// Last look, inside the transaction: a pin taken since the check
 		// above wins. (fill.Manager.Open must still re-read the unit state
-		// after it pins, and treat a missing blob as a refault.)
+		// after it pins, and treat a missing file as a refault.)
 		if p, err := c.pinned(ctx, q, u.ID); err != nil {
 			return err
 		} else if p {
@@ -527,18 +484,24 @@ func (c *Collector) evict(ctx context.Context, u meta.Unit) error {
 	})
 	c.db.Changed() // the content refs above, written outside a meta.Tx
 	if err != nil {
-		return err
+		return 0, err
 	}
-	c.cfg.Logf("gc: evicted %s/%s (%d logical bytes)", u.Subsystem, u.Key, u.LogicalBytes)
+	// The files go after the commit: an open that read the inode before it
+	// still finds its file, or sees it missing and refaults.
+	freed, err := c.store.RemoveUnit(u.ID)
+	if err != nil {
+		c.cfg.Logf("gc: evict %s/%s: removing files: %v", u.Subsystem, u.Key, err)
+	}
+	c.cfg.Logf("gc: evicted %s/%s (%d logical bytes, %d freed)", u.Subsystem, u.Key, u.LogicalBytes, freed)
 	if c.cfg.Notify != nil {
 		ev := u
 		ev.State = meta.UnitEvicted
 		c.cfg.Notify(fill.UnitEvent{Unit: ev, From: meta.UnitResident, To: meta.UnitEvicted})
 	}
-	return nil
+	return freed, nil
 }
 
-// unitContents counts a unit's file inodes per content ref.
+// unitContents counts a unit's file inodes per content digest.
 func unitContents(ctx context.Context, q querier, unit int64) (map[string]int64, error) {
 	rows, err := q.QueryContext(ctx, `SELECT content, count(*) FROM inode WHERE unit = ? AND kind = ? AND content != '' GROUP BY content`, unit, meta.KindFile)
 	if err != nil {
@@ -557,228 +520,19 @@ func unitContents(ctx context.Context, q querier, unit int64) (map[string]int64,
 	return out, rows.Err()
 }
 
-// unrefContent drops n references to content ref, and the content object
-// itself when none remain.
-func unrefContent(ctx context.Context, q querier, ref string, n int64, now int64) error {
+// unrefContent drops n references to a content digest, and the content
+// row itself when none remain.
+func unrefContent(ctx context.Context, q querier, digest string, n int64) error {
 	var refs int64
-	err := q.QueryRowContext(ctx, `UPDATE content SET refs = max(refs - ?, 0) WHERE ref = ? RETURNING refs`, n, ref).Scan(&refs)
+	err := q.QueryRowContext(ctx, `UPDATE content SET refs = max(refs - ?, 0) WHERE digest = ? RETURNING refs`, n, digest).Scan(&refs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // already gone (a repaired audit, or never recorded)
 	}
-	if err != nil {
+	if err != nil || refs > 0 {
 		return err
 	}
-	if refs > 0 {
-		return nil
-	}
-	return dropContent(ctx, q, ref, now)
-}
-
-// dropContent deletes a content object and dooms blobs it leaves unused.
-func dropContent(ctx context.Context, q querier, ref string, now int64) error {
-	if _, err := q.ExecContext(ctx, `UPDATE gc_blob SET refs = refs - 1,
-		doomed_at = CASE WHEN refs - 1 <= 0 THEN ? ELSE doomed_at END
-		WHERE ref IN (SELECT blob FROM gc_content_blob WHERE content = ?)`, now, ref); err != nil {
-		return err
-	}
-	if _, err := q.ExecContext(ctx, `DELETE FROM gc_content_blob WHERE content = ?`, ref); err != nil {
-		return err
-	}
-	_, err := q.ExecContext(ctx, `DELETE FROM content WHERE ref = ?`, ref)
+	_, err = q.ExecContext(ctx, `DELETE FROM content WHERE digest = ?`, digest)
 	return err
-}
-
-// SweepResult reports what a sweep deleted.
-type SweepResult struct {
-	Blobs int
-	Bytes int64
-	Held  int // doomed blobs skipped because an ingest holds them
-}
-
-// Sweep deletes doomed blobs from the CAS.
-func (c *Collector) Sweep(ctx context.Context) (SweepResult, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, err := c.backfill(ctx); err != nil {
-		return SweepResult{}, err
-	}
-	return c.sweep(ctx)
-}
-
-func (c *Collector) sweep(ctx context.Context) (SweepResult, error) {
-	var res SweepResult
-	after := ""
-	for {
-		var doomed []string
-		rows, err := c.sql.QueryContext(ctx, `SELECT ref FROM gc_blob WHERE refs <= 0 AND ref > ? ORDER BY ref LIMIT 500`, after)
-		if err != nil {
-			return res, err
-		}
-		for rows.Next() {
-			var r string
-			if err := rows.Scan(&r); err != nil {
-				rows.Close()
-				return res, err
-			}
-			doomed = append(doomed, r)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return res, err
-		}
-		if len(doomed) == 0 {
-			return res, nil
-		}
-		after = doomed[len(doomed)-1]
-		removed, freed, err := c.removeUnreferenced(ctx, doomed)
-		if err != nil {
-			return res, err
-		}
-		res.Blobs += len(removed)
-		res.Bytes += freed
-		res.Held += len(doomed) - len(removed)
-	}
-}
-
-// removeUnreferenced deletes those of refs that no content uses, as
-// confirmed from the DB after they are locked against new holds, and then
-// their gc_blob rows.
-func (c *Collector) removeUnreferenced(ctx context.Context, refs []string) ([]string, int64, error) {
-	removed, freed, err := c.store.Remove(ctx, refs, func(cand []string) ([]string, error) {
-		// New content may have committed since the candidates were read;
-		// count it first so a revived blob is seen as referenced.
-		if _, err := c.backfill(ctx); err != nil {
-			return nil, err
-		}
-		live, err := c.liveBlobs(ctx, cand)
-		if err != nil {
-			return nil, err
-		}
-		out := cand[:0:0]
-		for _, r := range cand {
-			if !live[r] {
-				out = append(out, r)
-			}
-		}
-		return out, nil
-	})
-	if err != nil || len(removed) == 0 {
-		return removed, freed, err
-	}
-	err = c.write(ctx, func(q querier) error {
-		for _, r := range removed {
-			if _, err := q.ExecContext(ctx, `DELETE FROM gc_blob WHERE ref = ? AND refs <= 0`, r); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	return removed, freed, err
-}
-
-// liveBlobs returns which of refs have a gc_blob row with refs > 0.
-func (c *Collector) liveBlobs(ctx context.Context, refs []string) (map[string]bool, error) {
-	live := map[string]bool{}
-	for len(refs) > 0 {
-		n := min(len(refs), 500)
-		batch := refs[:n]
-		refs = refs[n:]
-		args := make([]any, len(batch))
-		for i, r := range batch {
-			args[i] = r
-		}
-		rows, err := c.sql.QueryContext(ctx, `SELECT ref FROM gc_blob WHERE refs > 0 AND ref IN (?`+strings.Repeat(",?", len(batch)-1)+`)`, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var r string
-			if err := rows.Scan(&r); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			live[r] = true
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-	}
-	return live, nil
-}
-
-// backfill tracks content rows the GC has not seen: it walks each one's
-// schema in the CAS and counts its blobs. It returns the refs of content
-// whose blobs are missing; those stay untracked and the audit reports them.
-func (c *Collector) backfill(ctx context.Context) (missing []string, err error) {
-	after := ""
-	for {
-		rows, err := c.sql.QueryContext(ctx, `SELECT c.ref FROM content c
-			WHERE c.ref > ? AND NOT EXISTS (SELECT 1 FROM gc_content_blob cb WHERE cb.content = c.ref)
-			ORDER BY c.ref LIMIT 200`, after)
-		if err != nil {
-			return missing, err
-		}
-		var refs []string
-		for rows.Next() {
-			var r string
-			if err := rows.Scan(&r); err != nil {
-				rows.Close()
-				return missing, err
-			}
-			refs = append(refs, r)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return missing, err
-		}
-		if len(refs) == 0 {
-			return missing, nil
-		}
-		after = refs[len(refs)-1]
-		walked := map[string][]cas.Blob{}
-		for _, r := range refs {
-			bs, err := c.store.Blobs(ctx, r)
-			if err != nil {
-				c.cfg.Logf("gc: content %s: %v", r, err)
-				missing = append(missing, r)
-				continue
-			}
-			walked[r] = bs
-		}
-		err = c.write(ctx, func(q querier) error {
-			for r, bs := range walked {
-				if err := trackContent(ctx, q, r, bs); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return missing, err
-		}
-	}
-}
-
-// trackContent records that content ref is made of blobs, once.
-func trackContent(ctx context.Context, q querier, ref string, blobs []cas.Blob) error {
-	var exists int
-	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM content WHERE ref = ?`, ref).Scan(&exists); err != nil || exists == 0 {
-		return err
-	}
-	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM gc_content_blob WHERE content = ?`, ref).Scan(&exists); err != nil || exists > 0 {
-		return err
-	}
-	for _, b := range blobs {
-		if _, err := q.ExecContext(ctx, `INSERT INTO gc_content_blob (content, blob) VALUES (?, ?)`, ref, b.Ref); err != nil {
-			return err
-		}
-		if _, err := q.ExecContext(ctx, `INSERT INTO gc_blob (ref, size, refs) VALUES (?, ?, 1)
-			ON CONFLICT (ref) DO UPDATE SET refs = max(refs, 0) + 1, doomed_at = 0`, b.Ref, b.Size); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Pin is a durable pin.

@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
@@ -71,7 +71,7 @@ func TestMeasure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store, err := cas.Open(dir, 0)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,9 +79,8 @@ func TestMeasure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q := &fill.LocalQuota{CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: sp.Bytes}
-	shadow := filepath.Join(dir, "shadow")
-	m, err := fill.NewManager(db, store, sp, q, fill.Options{Shadow: shadow, Logf: t.Logf})
+	q := &fill.LocalQuota{Store: st.Used, Spool: sp.Bytes}
+	m, err := fill.NewManager(db, st, sp, q, fill.Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +108,7 @@ func TestMeasure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := Measure(ctx, db, store, Options{Dir: dir, Shadow: shadow})
+	r, err := Measure(ctx, db, st, Options{Dir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,25 +127,15 @@ func TestMeasure(t *testing.T) {
 	if tot.Contents != 3 || tot.ContentBytes != distinct {
 		t.Fatalf("contents %d / %d bytes, want 3 / %d", tot.Contents, tot.ContentBytes, distinct)
 	}
-	if tot.SchemaBlobs < 3 || tot.DataBlobs < 3 || tot.Blobs < tot.SchemaBlobs+tot.DataBlobs {
-		t.Errorf("blobs: %d schema, %d data, %d on disk", tot.SchemaBlobs, tot.DataBlobs, tot.Blobs)
+	// Identical files are one stored file with several names.
+	if tot.StoreFiles != 3 || tot.StoreLinks != 5 || tot.StoreBytes != distinct || tot.Copies != 0 {
+		t.Errorf("store: %d files, %d names, %d bytes, %d copies; want 3, 5, %d, 0", tot.StoreFiles, tot.StoreLinks, tot.StoreBytes, tot.Copies, distinct)
 	}
-	if tot.DataBytes != distinct {
-		t.Errorf("unique chunk bytes %d, want %d (random data does not chunk-dedupe)", tot.DataBytes, distinct)
+	if tot.CacheTotal != tot.StoreAllocated+tot.DB || tot.DB <= 0 {
+		t.Errorf("total %d, store %d, db %d", tot.CacheTotal, tot.StoreAllocated, tot.DB)
 	}
-	if tot.CASTotal < tot.BlobAllocated || tot.BlobOverhead <= 0 || tot.DB <= 0 {
-		t.Errorf("CAS total %d, blob allocated %d, overhead %d, db %d", tot.CASTotal, tot.BlobAllocated, tot.BlobOverhead, tot.DB)
-	}
-	if tot.B2 == nil || tot.B2.Units != 3 || tot.B2.Files != 5 || tot.B2.Logical != logical {
-		t.Fatalf("B2 = %+v", tot.B2)
-	}
-	// In a corpus this small the metadata DB dominates CAS total, so check
-	// the store alone.
-	if tot.StoreAllocated > tot.B2.Allocated*6/10 || tot.B3Estimate >= tot.B2.Allocated {
-		t.Errorf("store %d, B3 estimate %d, B2 %d", tot.StoreAllocated, tot.B3Estimate, tot.B2.Allocated)
-	}
-	if want := 1 - float64(tot.CASTotal)/float64(tot.B2.Allocated); tot.Ratios.SavingsB2 != want {
-		t.Errorf("savings vs B2 %.4f, want %.4f", tot.Ratios.SavingsB2, want)
+	if tot.NoDedupe <= tot.StoreAllocated || tot.Ratios.SavingsNoDedupe <= 0.3 {
+		t.Errorf("no-dedupe estimate %d, store %d, savings %.3f", tot.NoDedupe, tot.StoreAllocated, tot.Ratios.SavingsNoDedupe)
 	}
 
 	sub := map[string]Subsystem{}
@@ -163,11 +152,12 @@ func TestMeasure(t *testing.T) {
 	if b.ExclusiveBytes < int64(len(own)) || a.ExclusiveBytes < 5 || a.ExclusiveBytes > int64(len(own)) {
 		t.Errorf("exclusive: aa %d, bb %d", a.ExclusiveBytes, b.ExclusiveBytes)
 	}
-	if got := a.Attributed + b.Attributed; got > tot.BlobAllocated || got < tot.BlobAllocated-tot.Blobs {
-		t.Errorf("attributed %d, blob allocated %d", got, tot.BlobAllocated)
+	files := tot.StoreAllocated - tot.StoreDirBytes
+	if got := a.Attributed + b.Attributed; got > files || got < files-2 {
+		t.Errorf("attributed %d, stored files allocated %d", got, files)
 	}
-	if a.B2 == nil || a.SavingsB2 <= b.SavingsB2 {
-		t.Errorf("aa (a duplicate within and across) should save more than bb: %.3f vs %.3f", a.SavingsB2, b.SavingsB2)
+	if a.WholeFileDedupe <= b.WholeFileDedupe {
+		t.Errorf("aa (a duplicate within) should dedupe more than bb: %.3f vs %.3f", a.WholeFileDedupe, b.WholeFileDedupe)
 	}
 
 	if len(r.TopShared) == 0 || r.TopShared[0].Files != 3 || strings.Join(r.TopShared[0].Subsystems, ",") != "aa,bb" || r.TopShared[0].Path == "" {
@@ -178,8 +168,5 @@ func TestMeasure(t *testing.T) {
 	}
 	if r.SizeClasses[0].Contents != 1 || r.SizeClasses[3].Contents != 2 {
 		t.Errorf("size classes = %+v", r.SizeClasses)
-	}
-	if r.Broken != 0 {
-		t.Errorf("%d broken contents", r.Broken)
 	}
 }

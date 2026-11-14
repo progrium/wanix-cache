@@ -19,6 +19,17 @@ type Migration struct {
 var coreMigrations = []Migration{
 	// Whiteouts and opaque directories for OCI layers.
 	{1, `ALTER TABLE inode ADD COLUMN flags INTEGER NOT NULL DEFAULT 0`},
+	// The plain-file store replaces the CAS. inode.content becomes the
+	// file's whole-file digest (the content table's key), and the bytes
+	// live at files/<unit>/<ino>. A cache made with the CAS keeps its
+	// manifests: resident units become evicted and refault on next use.
+	// The index finds an existing file with the same digest to hard-link.
+	{2, `
+UPDATE unit SET state = 4 WHERE state = 3;
+UPDATE inode SET content = '' WHERE content != '';
+DELETE FROM content;
+CREATE INDEX IF NOT EXISTS inode_content ON inode (content) WHERE content != '';
+`},
 }
 
 // Inode flags.

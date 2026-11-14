@@ -11,11 +11,10 @@ only needed once, to build the corpus.
 | `savingsbench apk` | Fetches each package of an apk manifest through the cache's HTTP mirror, as `apk add` would (`-k` logs failures and goes on). |
 | `savingsbench walk` | Opens and reads every file under 9P roots (`/oci/...`, `/nix/closure/...`, `/apk/x86_64`), one connection per reader. |
 | `savingsbench settle` | Waits until no unit is fetching or spooled. |
-| `savingsbench b3` | B3 from the shadow tree: identical files hard-linked (`-link` does it in place, like `rdfind -makehardlinks` or `nix-store --optimise`, and measures with st_blocks). |
-| `savingsbench variants` | V1 (one blob per distinct content, no chunking) and V2 (each data blob zstd level 3, kept raw when that isn't smaller), computed offline from the V0 store. |
-| `run.sh` | One run: fresh cache with `-debug-shadow`, drive, settle, `stats -json`, B3, variants, `run.json` (commit, filesystem, timings, corpus manifest hashes). `AGAIN=1` drives the same inputs a second time into the same cache (W8). |
+| `ninebench` | Reads every file of a cache's own store over 9P2000.L with N readers (`-j`), warm or with the page cache dropped (`-cold`), and reports files/s and MiB/s. |
+| `run.sh` | One run: fresh cache, drive, settle, `stats -json`, `run.json` (commit, filesystem, timings, corpus manifest hashes). `ZSTD=L` serves with `-zstd L`. `AGAIN=1` drives the same inputs a second time into the same cache (W8). |
 | `all.sh` | W0 to W8 in order. |
-| `report.py` | Turns result directories into one JSON table and a Markdown summary. |
+| `report.py` | Turns result directories into one JSON table and a Markdown summary: the store against B1 (compressed downloads) and against the same units with no dedupe. |
 
 ```sh
 go build -o bin/wanix-cache ./cmd/wanix-cache
@@ -41,6 +40,15 @@ python3 -I bench/savings/report.py $C results > report.json
 Tags float, so a corpus built later differs; the manifests pin what a run
 used, and `run.json` records their hashes.
 
+## Since the plan ran
+
+The plan was written for a CAS: B2 was a plain unpacked copy, B3 that copy
+with identical files hard-linked, and V0 to V2 were CAS variants. The runs
+showed B3 within about 11% of the CAS and faster to read, so the cache now
+*is* B3: plain files with identical files hard-linked. The shadow tree,
+`b3`, `variants` and `-pack-small` are gone. `stats` reports the store
+directly, and its "without dedupe" estimate stands in for B2.
+
 ## Deviations from the plan
 
 - W4 uses the `-slim` Python and Node images (nginx is the Debian default)
@@ -50,7 +58,7 @@ used, and `run.json` records their hashes.
   in December. September and October evaluate to identical store paths for
   all four packages (no rebuild in the stable channel that month), so July
   was added to get a within-channel generation that differs.
-- B3 is measured by hard-linking identical files in the shadow tree itself
-  (`b3 -link`), not with `rdfind` on a copy.
-- V1 and V2 are computed from the V0 store, not by rerunning ingest.
+- In the CAS-era runs, B3 was measured by hard-linking identical files in
+  the shadow tree itself, not with `rdfind` on a copy, and V1 and V2 were
+  computed from the V0 store.
 - Only ext4 (4 KiB blocks); W1 ran three times, the others once.

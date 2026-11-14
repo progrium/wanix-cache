@@ -11,11 +11,11 @@
 //	                          (view.go)
 //
 // A store path's NAR is fetched, decompressed and unpacked into the spool as
-// it streams, so the tree is stored as files (which dedupe in the CAS) and
-// never as a compressed archive. The NarHash is checked over the stream.
-// NARs served to guests are rebuilt from the tree; NAR serialization is
-// deterministic, so they hash to the same NarHash and upstream signatures
-// stay valid.
+// it streams, so the tree is stored as plain files (identical files once,
+// as hard links) and never as a compressed archive. The NarHash is checked
+// over the stream. NARs served to guests are rebuilt from the tree; NAR
+// serialization is deterministic, so they hash to the same NarHash and
+// upstream signatures stay valid.
 package nix
 
 import (
@@ -334,7 +334,7 @@ func (s *Subsystem) NAR(ctx context.Context, sp StorePath, w io.Writer) (int64, 
 }
 
 // unitTree is a unit's manifest as a NAR Tree, with bytes from the fill
-// manager (spool or CAS).
+// manager (spool or store).
 type unitTree struct {
 	ctx  context.Context
 	db   *meta.DB

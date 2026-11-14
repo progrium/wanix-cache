@@ -101,7 +101,7 @@ func TestUsage(t *testing.T) {
 
 	// Evict the raw unit and fetch it again through the mirror: a refetch,
 	// and the history is still there.
-	col, err := gc.New(ctx, h.db, h.store, gc.Config{})
+	col, err := gc.New(ctx, h.db, h.st, gc.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

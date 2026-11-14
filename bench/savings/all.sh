@@ -10,7 +10,7 @@ W1=$(apk 3.20)
 W2="$(apk 3.18) $(apk 3.19) $(apk 3.20) $(apk 3.21)"
 W3=$(oci w3); W4=$(oci w4); W5=$(oci w5)
 W6="$(nix 24.05-jul) $(nix 24.05-sep) $(nix 24.05-oct) $(nix 24.11-dec)"
-run() { LINK=1 "$here/run.sh" "$@" || echo "RUN FAILED: $1"; }
+run() { "$here/run.sh" "$@" || echo "RUN FAILED: $1"; }
 [[ -n ${GOSRC:-} ]] && run w0 "local:$GOSRC"
 [[ -n ${SKIP_W1:-} ]] || for i in 1 2 3; do run w1-r$i $W1; done
 run w2 $W2

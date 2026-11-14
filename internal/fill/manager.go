@@ -14,29 +14,24 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
 // Options configures a LocalManager.
 type Options struct {
-	// Workers bounds concurrent ingest of spool files into the CAS.
-	// Default 4.
+	// Workers bounds how many spool files ingest hashes and stores at
+	// once. Default 4.
 	Workers int
 	// Logf receives background errors. Default log.Printf.
 	Logf func(string, ...any)
 	// HoldIngest leaves spooled units in the spool until ResumeIngest is
 	// called. For tests, and for inspecting the spool.
 	HoldIngest bool
-	// Shadow, if set, turns on the debug savings mode: after ingest each
-	// resident unit is also kept unpacked as a plain tree under
-	// Shadow/<subsystem>/<unit id>, hard-linked from its spool files, so
-	// disk use can be compared with the CAS (see internal/savings). Shadow
-	// bytes are not counted by the quota and are removed on eviction.
-	Shadow string
 }
 
 // LocalManager is the Manager for one cache directory.
@@ -44,7 +39,7 @@ type LocalManager struct {
 	Pins
 
 	db    *meta.DB
-	store *cas.Store
+	store *store.Store
 	spool *DiskSpool
 	quota *LocalQuota
 	opts  Options
@@ -57,7 +52,6 @@ type LocalManager struct {
 	// ingesting counts ingestUnit calls in progress, so Wait covers the
 	// gap between the resident commit and the spool removal.
 	ingesting atomic.Int64
-	shadowMu  sync.Mutex // serializes shadow tree writes and SyncShadow
 	resume    chan struct{}
 
 	mu       sync.Mutex
@@ -84,7 +78,7 @@ func (f *flight) start() { f.once.Do(func() { close(f.started) }) }
 // NewManager recovers state left by a previous run and starts the ingest
 // workers. Units caught mid-fetch are dropped (they refetch on next use);
 // spooled units are queued for ingest.
-func NewManager(db *meta.DB, store *cas.Store, spool *DiskSpool, quota *LocalQuota, opts Options) (*LocalManager, error) {
+func NewManager(db *meta.DB, st *store.Store, spool *DiskSpool, quota *LocalQuota, opts Options) (*LocalManager, error) {
 	if opts.Workers <= 0 {
 		opts.Workers = 4
 	}
@@ -92,7 +86,7 @@ func NewManager(db *meta.DB, store *cas.Store, spool *DiskSpool, quota *LocalQuo
 		opts.Logf = log.Printf
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &LocalManager{db: db, store: store, spool: spool, quota: quota, opts: opts,
+	m := &LocalManager{db: db, store: st, spool: spool, quota: quota, opts: opts,
 		ctx: ctx, cancel: cancel, ingest: make(chan int64, 1024), sem: make(chan struct{}, opts.Workers),
 		subs: map[string]subsys.Subsystem{}, flights: map[string]*flight{}, resume: make(chan struct{})}
 	if !opts.HoldIngest {
@@ -155,6 +149,27 @@ func (m *LocalManager) recover() error {
 	for _, id := range ids {
 		if !keep[id] {
 			if err := m.spool.Remove(id); err != nil {
+				return err
+			}
+		}
+	}
+	// Store directories of units that are not resident are left from an
+	// eviction or an ingest cut short; spooled units' are finished by
+	// their ingest.
+	resident, err := m.db.UnitsInState(ctx, meta.UnitResident)
+	if err != nil {
+		return err
+	}
+	for _, u := range resident {
+		keep[u.ID] = true
+	}
+	stored, err := m.store.Units()
+	if err != nil {
+		return err
+	}
+	for _, id := range stored {
+		if !keep[id] {
+			if _, err := m.store.RemoveUnit(id); err != nil {
 				return err
 			}
 		}
@@ -463,7 +478,7 @@ func (m *LocalManager) failFill(id int64, from meta.UnitState, cause error) {
 }
 
 // Open implements Manager.
-func (m *LocalManager) Open(ctx context.Context, in meta.Inode) (cas.File, error) {
+func (m *LocalManager) Open(ctx context.Context, in meta.Inode) (store.File, error) {
 	if in.Kind != meta.KindFile {
 		return nil, fmt.Errorf("fill: inode %d is not a regular file", in.Ino)
 	}
@@ -479,7 +494,7 @@ func (m *LocalManager) Open(ctx context.Context, in meta.Inode) (cas.File, error
 }
 
 // OpenPath implements Manager.
-func (m *LocalManager) OpenPath(ctx context.Context, sub string, key subsys.Key, rel string) (cas.File, meta.Inode, error) {
+func (m *LocalManager) OpenPath(ctx context.Context, sub string, key subsys.Key, rel string) (store.File, meta.Inode, error) {
 	u, err := m.Ensure(ctx, sub, key, false)
 	if err != nil {
 		return nil, meta.Inode{}, err
@@ -509,7 +524,7 @@ func (m *LocalManager) OpenPath(ctx context.Context, sub string, key subsys.Key,
 	return f, in, err
 }
 
-func (m *LocalManager) open(ctx context.Context, in meta.Inode) (cas.File, error) {
+func (m *LocalManager) open(ctx context.Context, in meta.Inode) (store.File, error) {
 	// Re-read first: the caller's inode may predate an ingest or an
 	// eviction, and eviction may race with the pin taken by Open.
 	if fresh, err := m.db.Get(ctx, in.Ino); err == nil {
@@ -517,12 +532,12 @@ func (m *LocalManager) open(ctx context.Context, in meta.Inode) (cas.File, error
 	}
 	for attempt := 0; attempt < 4; attempt++ {
 		if in.Content != "" {
-			f, err := m.store.Open(ctx, in.Content)
+			f, err := m.store.Open(in.Unit, in.Ino)
 			if err == nil {
 				return f, nil
 			}
-			// A blob can vanish if eviction committed between our pin and
-			// this open. If the inode no longer has that ref, treat it as a
+			// The file can vanish if eviction committed between our pin and
+			// this open. If the inode no longer has content, treat it as a
 			// refault and go round again; otherwise it is a real error.
 			fresh, gerr := m.db.Get(ctx, in.Ino)
 			if gerr != nil || fresh.Content == in.Content {
@@ -564,7 +579,7 @@ func (m *LocalManager) open(ctx context.Context, in meta.Inode) (cas.File, error
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("fill: inode %d: no data in the spool or the CAS", in.Ino)
+	return nil, fmt.Errorf("fill: inode %d: no data in the spool or the store", in.Ino)
 }
 
 // waitChange blocks until a spool file for ino exists or the flight ends.
@@ -598,7 +613,7 @@ func (m *LocalManager) waitChange(ctx context.Context, ino uint64, f *flight) er
 }
 
 type pinnedFile struct {
-	cas.File
+	store.File
 	m        *LocalManager
 	in       meta.Inode
 	read     atomic.Int64
@@ -789,18 +804,18 @@ func (m *LocalManager) ingestLoop() {
 	}
 }
 
-// ingestUnit chunks a spooled unit's files into the CAS, with up to
-// Options.Workers files in flight, then records every content ref and moves
-// the unit to resident in one transaction, and drops its spool. No write
-// transaction is held across CAS puts.
+// ingestUnit moves a spooled unit's files into the store and the unit to
+// resident. Up to Options.Workers files are hashed at once. Each distinct
+// content is stored once: a file whose digest is already in the store, in
+// this unit or another, becomes a hard link to that file; otherwise its
+// spool file is linked into the store, so nothing is copied. Then every
+// content digest is recorded and the unit made resident in one
+// transaction, and its spool dropped. No write transaction is held while
+// files are hashed or linked.
 func (m *LocalManager) ingestUnit(id int64) error {
 	m.ingesting.Add(1)
 	defer m.ingesting.Add(-1)
 	ctx := m.ctx
-	// Every blob put or found stays safe from a GC sweep until the content
-	// refs that keep it are committed.
-	sess := m.store.Session()
-	defer sess.Close()
 	u, err := m.db.UnitByID(ctx, id)
 	if err != nil || u.State != meta.UnitSpooled {
 		return err
@@ -810,9 +825,9 @@ func (m *LocalManager) ingestUnit(id int64) error {
 		return err
 	}
 	type result struct {
-		ino         uint64
-		digest, ref string
-		size        int64
+		ino    uint64
+		digest string
+		size   int64
 	}
 	var (
 		wg       sync.WaitGroup
@@ -829,7 +844,7 @@ func (m *LocalManager) ingestUnit(id int64) error {
 		wg.Add(1)
 		go func() {
 			defer func() { <-m.sem; wg.Done() }()
-			digest, ref, err := m.ingestFile(ctx, sess, in)
+			digest, err := m.hashSpool(in)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -838,14 +853,48 @@ func (m *LocalManager) ingestUnit(id int64) error {
 				}
 				return
 			}
-			results = append(results, result{in.Ino, digest, ref, in.Size})
+			results = append(results, result{in.Ino, digest, in.Size})
 		}()
 	}
 	wg.Wait()
 	if firstErr != nil {
 		return firstErr
 	}
-	// The bytes are in the CAS now: stop counting the spool copy so the
+
+	// Store each distinct content once, then link the unit's other files
+	// with that content to it.
+	groups := map[string][]uint64{}
+	var order []string
+	for _, r := range results {
+		if groups[r.digest] == nil {
+			order = append(order, r.digest)
+		}
+		groups[r.digest] = append(groups[r.digest], r.ino)
+	}
+	for _, d := range order {
+		m.sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() { <-m.sem; wg.Done() }()
+			err := m.storeGroup(ctx, id, d, groups[d])
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := m.store.SyncUnit(id); err != nil {
+		return err
+	}
+
+	// The bytes are in the store now: stop counting the spool copy so the
 	// quota does not count the unit twice until the spool is removed.
 	released := m.spool.Release(id)
 	tx, err := m.db.Begin(ctx)
@@ -854,8 +903,8 @@ func (m *LocalManager) ingestUnit(id int64) error {
 		return err
 	}
 	for _, r := range results {
-		if err = tx.RefContent(r.digest, r.ref, r.size); err == nil {
-			err = tx.SetContent(r.ino, r.ref)
+		if err = tx.RefContent(r.digest, r.size); err == nil {
+			err = tx.SetContent(r.ino, r.digest)
 		}
 		if err != nil {
 			break
@@ -874,11 +923,6 @@ func (m *LocalManager) ingestUnit(id int64) error {
 		return err
 	}
 	u, _ = m.db.UnitByID(ctx, id)
-	if m.opts.Shadow != "" {
-		if err := m.shadowUnit(ctx, u); err != nil {
-			m.opts.Logf("fill: unit %d: shadow tree: %v", id, err)
-		}
-	}
 	if err := m.spool.Remove(id); err != nil {
 		m.opts.Logf("fill: unit %d: removing spool: %v", id, err)
 	}
@@ -886,34 +930,62 @@ func (m *LocalManager) ingestUnit(id int64) error {
 	return nil
 }
 
-// ingestFile stores one spool file in the CAS, skipping the chunker when
-// its whole-file digest is already known.
-func (m *LocalManager) ingestFile(ctx context.Context, sess *cas.Session, in meta.Inode) (digest, ref string, err error) {
+// hashSpool returns the whole-file digest of a spool file.
+func (m *LocalManager) hashSpool(in meta.Inode) (string, error) {
 	f, err := m.spool.Open(in.Ino)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, io.NewSectionReader(f, 0, in.Size)); err != nil {
-		return "", "", err
+		return "", err
 	}
-	digest = "sha256-" + hex.EncodeToString(h.Sum(nil))
-	ref, ok, err := m.db.ContentRef(ctx, digest)
-	if err != nil {
-		return "", "", err
-	}
-	if ok {
-		// Hold fails if a sweep removed a blob since the ref was read;
-		// put the bytes again then.
-		if _, err := sess.Hold(ctx, ref); err == nil {
-			return digest, ref, nil
+	return "sha256-" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// storeGroup stores the files of unit that have one digest: the first is
+// linked to a stored file with that digest if there is one, or else stored
+// from its spool file, and the rest are linked to the first.
+func (m *LocalManager) storeGroup(ctx context.Context, unit int64, digest string, inos []uint64) error {
+	first := inos[0]
+	linked := false
+	if su, sino, ok, err := m.db.LinkSource(ctx, digest); err != nil {
+		return err
+	} else if ok {
+		err := m.store.Link(su, sino, unit, first)
+		switch {
+		case err == nil:
+			linked = true
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.EMLINK):
+			// Evicted since we looked, or at the link limit: store our own.
+		default:
+			return fmt.Errorf("inode %d: %w", first, err)
 		}
 	}
-	if ref, err = sess.Put(ctx, io.NewSectionReader(f, 0, in.Size)); err != nil {
-		return "", "", err
+	if !linked {
+		p, ok := m.spool.path(first)
+		if !ok {
+			return fmt.Errorf("inode %d: no spool file", first)
+		}
+		if err := m.store.Add(unit, first, p); err != nil {
+			return fmt.Errorf("inode %d: %w", first, err)
+		}
 	}
-	return digest, ref, nil
+	for _, ino := range inos[1:] {
+		err := m.store.Link(unit, first, unit, ino)
+		if errors.Is(err, syscall.EMLINK) {
+			p, ok := m.spool.path(ino)
+			if !ok {
+				return fmt.Errorf("inode %d: no spool file", ino)
+			}
+			err = m.store.Add(unit, ino, p)
+		}
+		if err != nil {
+			return fmt.Errorf("inode %d: %w", ino, err)
+		}
+	}
+	return nil
 }
 
 // fillSink writes a fetch into the namespace and the spool.

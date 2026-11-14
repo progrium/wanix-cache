@@ -16,6 +16,48 @@ Unless an entry says otherwise, the setup is the same for all entries:
   - **Cold** drops the kernel caches first (`-cold`).
 - **Raw results:** in the project files under `savings-results/`.
 
+## 2026-11-14 · Plain files with hard links replace the CAS
+
+**Commit:** the one that adds this entry ("Replace the CAS with plain files
+and hard links")
+
+The Perkeep CAS is gone. Each stored file is a plain file under
+`DATA/files/<unit>/<inode>`, and identical files are hard-linked across
+units and subsystems. Ingest links spool files into the store instead of
+chunking and copying them. zstd is now per file and still off by default.
+
+**W0** (the Go source tree as one local unit: 12,054 files, 126.3 MiB
+logical), old build at cc1158f against the new store, ninebench with
+`-passes 2`:
+
+| | CAS (cc1158f) | Plain files |
+|---|---:|---:|
+| Import (s) | 23.7 | 22.7 |
+| Store on disk (MiB) | 281.2 | 154.7 |
+| Cache directory with DB (MiB) | 289.4 | 162.4 |
+| First read (files/s) | 13.1k to 14.3k | 15.6k to 16.4k |
+| Warm, repeat read (files/s) | 17.3k to 17.8k | 20.6k to 21.8k |
+| Cold (files/s) | 5.9k to 6.9k | 10.3k to 11.7k |
+
+With `serve -zstd 2` the new store holds W0 in 69.6 MiB of files and reads
+12.9k files/s on a first pass and 16.5k warm.
+
+**W7** (from the savings runs that led to the decision; there the CAS
+store was compared with a hard-linked plain copy of the same tree):
+
+| | Plain files + hard links | CAS |
+|---|---:|---:|
+| Store (MiB) | 3,372 | 3,013 |
+| Store with zstd (MiB) | 1,519 | 1,293 |
+| Whole tree over 9P, with the namespace cache (files/s) | 15.6k | 12.5k |
+
+The CAS saved about 11% on W7 and cost about 20% of read speed, and on
+small-file trees it was larger than plain files. Read speed comes first,
+so plain files won.
+
+**The entries below are from the CAS era.** Their numbers were measured on
+the old store; packing, the blob cache and per-blob zstd no longer exist.
+
 ## 2026-11-14 · Compression read cost (zstd stays off by default)
 
 **Commit:** 9a013b7 (the decision; per-blob zstd itself is f5e9e87)

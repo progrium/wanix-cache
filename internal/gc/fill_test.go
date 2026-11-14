@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
@@ -57,7 +57,7 @@ func TestFillManagerPastCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	store, err := cas.Open(dir, 0)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,8 +66,8 @@ func TestFillManagerPastCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	const size = 200 << 10
-	quota := &fill.LocalQuota{Max: 5 * size, CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: spool.Bytes}
-	m, err := fill.NewManager(db, store, spool, quota, fill.Options{Logf: t.Logf})
+	quota := &fill.LocalQuota{Max: 5 * size, Store: st.Used, Spool: spool.Bytes}
+	m, err := fill.NewManager(db, st, spool, quota, fill.Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,9 +79,9 @@ func TestFillManagerPastCap(t *testing.T) {
 	if err := m.Register(ctx, sub); err != nil {
 		t.Fatal(err)
 	}
-	c, err := New(ctx, db, store, Config{
+	c, err := New(ctx, db, st, Config{
 		Max:   quota.Max,
-		Usage: func() int64 { u := quota.Usage(); return u.CAS + u.Spool + u.Reserved },
+		Usage: func() int64 { u := quota.Usage(); return u.Store + u.Spool + u.Reserved },
 		Logf:  t.Logf,
 	})
 	if err != nil {
@@ -125,14 +125,14 @@ func TestFillManagerPastCap(t *testing.T) {
 		}
 		resident(k)
 		db.TouchUnits(ctx, map[int64]time.Time{mustUnit(t, db, k).ID: time.Unix(int64(100+i), 0)})
-		if u := quota.Usage(); u.CAS+u.Spool > u.Max {
-			t.Fatalf("after %s: %d bytes over the cap of %d", k, u.CAS+u.Spool, u.Max)
+		if u := quota.Usage(); u.Store+u.Spool > u.Max {
+			t.Fatalf("after %s: %d bytes over the cap of %d", k, u.Store+u.Spool, u.Max)
 		}
 	}
 	if s := mustUnit(t, db, "a").State; s != meta.UnitEvicted {
 		t.Fatalf("oldest unit is %v after filling past the cap", s)
 	}
-	rep := (&env{t: t, ctx: ctx, db: db, store: store, c: c}).audit()
+	rep := (&env{t: t, ctx: ctx, db: db, st: st, c: c}).audit()
 	t.Logf("after fill:\n%s", rep)
 
 	// Refault the evicted unit by reading it.
@@ -142,7 +142,7 @@ func TestFillManagerPastCap(t *testing.T) {
 		t.Errorf("a fetched %d times, want 2", sub.fetches["a"])
 	}
 	read("l")
-	(&env{t: t, ctx: ctx, db: db, store: store, c: c}).audit()
+	(&env{t: t, ctx: ctx, db: db, st: st, c: c}).audit()
 
 	// Pin everything resident; a new fill no longer fits.
 	us, _ := db.Units(ctx, "mem")
@@ -152,7 +152,7 @@ func TestFillManagerPastCap(t *testing.T) {
 		}
 	}
 	sub.files["z"] = random(26, size)
-	if _, err := m.Ensure(ctx, "mem", "z", true); !errors.Is(err, cas.ErrFull) {
+	if _, err := m.Ensure(ctx, "mem", "z", true); !errors.Is(err, store.ErrFull) {
 		t.Fatalf("ensure with everything pinned: %v, want ErrFull", err)
 	}
 }

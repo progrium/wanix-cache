@@ -6,9 +6,9 @@
 #
 # Env: CORPUS (corpus dir, default ./corpus), WORK (cache dirs, default
 # ./work), OUT (results, default ./results), BIN (dir with wanix-cache and
-# savingsbench), KEEP=1 keeps the cache dir, LINK=1 measures B3 by actually
-# hard-linking the shadow tree, PACK=N serves with -pack-small N, ZSTD=L with -zstd L, AGAIN=1 drives every input a second time
-# into the same cache after measuring (W8).
+# savingsbench), KEEP=1 keeps the cache dir, ZSTD=L serves with -zstd L,
+# AGAIN=1 drives every input a second time into the same cache after
+# measuring (W8).
 #
 # The corpus server (savingsbench serve-corpus) must already be running on
 # its default ports.
@@ -19,7 +19,7 @@ D=$WORK/$name; R=$OUT/$name
 rm -rf "$D" "$R"; mkdir -p "$D" "$R"
 P9L=127.0.0.1:5640; P9=127.0.0.1:5641; MIRROR=127.0.0.1:8404
 
-"$BIN/wanix-cache" serve -data "$D" -debug-shadow -max-gib 0 ${PACK:+-pack-small $PACK} ${ZSTD:+-zstd $ZSTD} -9p $P9L -9p2000 $P9 \
+"$BIN/wanix-cache" serve -data "$D" -max-gib 0 ${ZSTD:+-zstd $ZSTD} -9p $P9L -9p2000 $P9 \
   -apk-upstream http://127.0.0.1:8401 -apk-mirror $MIRROR -apk-index-ttl 1h \
   -nix-substituters http://127.0.0.1:8403/ >"$R/serve.log" 2>&1 &
 srv=$!
@@ -47,23 +47,15 @@ drive() {
 t0=$(date +%s.%N)
 drive "$@" 2>&1 | tee "$R/drive.log"
 t1=$(date +%s.%N)
-# Reading /.cache/stats brings the shadow tree up to date.
-"$BIN/savingsbench" walk -9p $P9 /.cache >/dev/null 2>&1 || true
 kill -INT $srv; wait $srv || true; trap - EXIT
 
 "$BIN/wanix-cache" stats -data "$D" -json -n 20 >"$R/stats.json"
 "$BIN/wanix-cache" stats -data "$D" -n 20 >"$R/stats.txt"
-"$BIN/savingsbench" variants -data "$D" >"$R/variants.json"
-if [[ ${LINK:-} == 1 ]]; then
-  "$BIN/savingsbench" b3 -shadow "$D/shadow" -link >"$R/b3.json"
-else
-  "$BIN/savingsbench" b3 -shadow "$D/shadow" >"$R/b3.json"
-fi
-store=$(du -sB1 "$D/blobs" | cut -f1)
+store=$(du -sB1 "$D/files" | cut -f1)
 
 again=null
 if [[ ${AGAIN:-} == 1 ]]; then
-  before=$(du -sB1 --exclude=shadow "$D" | cut -f1)
+  before=$(du -sB1 "$D" | cut -f1)
   "$BIN/wanix-cache" serve -data "$D" -max-gib 0 -9p $P9L -9p2000 $P9 \
     -apk-upstream http://127.0.0.1:8401 -apk-mirror $MIRROR -apk-index-ttl 1h \
     -nix-substituters http://127.0.0.1:8403/ >"$R/serve-again.log" 2>&1 &
@@ -73,7 +65,7 @@ if [[ ${AGAIN:-} == 1 ]]; then
   drive "$@" 2>&1 | tee "$R/drive-again.log"
   tb=$(date +%s.%N)
   kill -INT $srv; wait $srv || true; trap - EXIT
-  after=$(du -sB1 --exclude=shadow "$D" | cut -f1)
+  after=$(du -sB1 "$D" | cut -f1)
   again="{\"before\": $before, \"after\": $after, \"seconds\": $(echo "$tb - $ta" | bc)}"
 fi
 
@@ -82,7 +74,7 @@ cat >"$R/run.json" <<EOF
  "commit": "$(git -C "$(dirname "$0")" rev-parse HEAD)",
  "fs": "$(stat -f -c %T "$D")", "block_size": $(stat -f -c %S "$D"),
  "seconds": $(echo "$t1 - $t0" | bc), "ingest_workers": 4,
- "du_blobs": $store, "again": $again,
+ "du_files": $store, "again": $again,
  "corpus_manifests": $(cd "$CORPUS/manifests" && sha256sum *.json | jq -R 'split("  ") | {(.[1]): .[0]}' | jq -s add)}
 EOF
 [[ ${KEEP:-} == 1 ]] || rm -rf "$D"

@@ -16,17 +16,17 @@ import (
 	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/client"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
 
 type env struct {
-	db    *meta.DB
-	store *cas.Store
-	fsys  *client.Fsys
+	db   *meta.DB
+	st   *store.Store
+	fsys *client.Fsys
 }
 
 func setup(t testing.TB) *env {
@@ -36,7 +36,7 @@ func setup(t testing.TB) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := cas.Open(dir, 0)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func setup(t testing.TB) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &ninep.Server{FS: &tree.FS{Meta: db, CAS: store}}
+	srv := &ninep.Server{FS: &tree.FS{Meta: db, Store: st}}
 	go srv.Serve(ln)
 	t.Cleanup(func() { ln.Close(); db.Close() })
 	c, err := net.Dial("tcp", ln.Addr().String())
@@ -60,7 +60,7 @@ func setup(t testing.TB) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	return &env{db: db, store: store, fsys: fsys}
+	return &env{db: db, st: st, fsys: fsys}
 }
 
 func writeFile(t testing.TB, p string, b []byte) {
@@ -118,7 +118,7 @@ func TestImportAndServe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := ingest.ImportDir(ctx, e.db, e.store, "local", "demo", src)
+	res, err := ingest.ImportDir(ctx, e.db, e.st, "local", "demo", src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,11 +128,10 @@ func TestImportAndServe(t *testing.T) {
 	if res.Unit.State != meta.UnitResident || res.Unit.Root == 0 {
 		t.Fatalf("unit %+v", res.Unit)
 	}
-	used, _ := e.store.Usage()
-	if used > int64(len(big))+64<<10 {
-		t.Errorf("CAS holds %d bytes for one 3 MiB file stored twice", used)
+	if used := e.st.Used(); used != int64(len(big))+int64(len("hello\n")) {
+		t.Errorf("store holds %d bytes for one 3 MiB file stored twice and one small file", used)
 	}
-	if _, err := ingest.ImportDir(ctx, e.db, e.store, "local", "demo", src); err == nil {
+	if _, err := ingest.ImportDir(ctx, e.db, e.st, "local", "demo", src); err == nil {
 		t.Error("second import with the same key succeeded")
 	}
 

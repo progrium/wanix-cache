@@ -1,6 +1,6 @@
 // Command wanix-cache is the H9 read-through cache.
 //
-//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR] [-debug-shadow] [-pack-small N] [-zstd L]
+//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR] [-max-gib N] [-zstd L]
 //	wanix-cache import [-data DIR] [-max-gib N] -key NAME SRC
 //	wanix-cache index  [-data DIR] [-all] [ROOT...]
 //	wanix-cache stats  [-data DIR] [-json] [-n N]
@@ -28,7 +28,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/gc"
 	"github.com/progrium/wanix-cache/internal/h9index"
@@ -36,6 +35,7 @@ import (
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
 	"github.com/progrium/wanix-cache/internal/savings"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
@@ -47,13 +47,13 @@ commands:
   serve    serve the cache read-only over 9P2000.L (and optionally plain 9P2000)
   import   import a local directory as a unit under /local/<key>
   index    generate the /.h9index of roots (such as /local/alpine)
-  stats    disk vs CAS savings, per subsystem (B2 needs serve -debug-shadow)
+  stats    what the cache stores and what dedupe saves, per subsystem
   units    list units
   usage    package, object and path usage; -untouched lists never-opened files
-  gc       sweep unreferenced blobs and evict down to the low watermark
+  gc       evict down to the low watermark when over the high one
   evict    evict one unit now (its manifest stays; a read refaults it)
   refault  bring an evicted local unit back from its source directory
-  audit    check refcounts against inodes and blobs on disk (-fix repairs)
+  audit    check refcounts and stored files against the metadata (-fix repairs)
   pin      pin a unit against eviction (-unpin removes; no -key lists pins)`)
 	os.Exit(2)
 }
@@ -71,27 +71,20 @@ func main() {
 	case "serve":
 		addrL := fl.String("9p", "127.0.0.1:5640", "9P2000.L TCP listen address (Linux guests); empty to disable")
 		addr := fl.String("9p2000", "", "plain 9P2000 TCP listen address (no symlinks); empty to disable")
-		gib := fl.Int64("max-gib", 10, "cap on CAS + spool bytes, GiB; 0 = unlimited")
-		workers := fl.Int("ingest-workers", 4, "files ingested into the CAS concurrently")
-		pack := fl.Int("pack-small", 0, "experimental: from now on store blobs of at most this many bytes in pack files (Perkeep diskpacked) instead of one file each; stays on once set. With it, stop the server before stats, gc or audit")
-		zst := fl.Int("zstd", 0, "optional, off by default (0): compress every blob with zstd at this level (1 fastest to 4 best), trading read speed for space; only on a new, empty cache, and stays on")
-		shadow := fl.Bool("debug-shadow", false, "debug savings mode: also keep every resident unit unpacked on plain disk under DATA/shadow, for /.cache/stats and `stats` (not counted by -max-gib)")
+		gib := fl.Int64("max-gib", 10, "cap on stored + spool bytes, GiB; 0 = unlimited")
+		workers := fl.Int("ingest-workers", 4, "spool files hashed and stored concurrently")
+		zst := fl.Int("zstd", 0, "optional, off by default (0): compress every stored file with zstd at this level (1 fastest to 4 best), trading read speed for space; only on a new, empty cache, and stays on")
 		addSubsystemFlags(fl)
 		fl.Parse(args)
-		if *pack > 0 {
-			if err := cas.EnablePacking(*data, *pack); err != nil {
-				log.Fatal(err)
-			}
-		}
 		if *zst > 0 {
-			if err := cas.EnableCompression(*data, *zst); err != nil {
+			if err := store.EnableCompression(*data, *zst); err != nil {
 				log.Fatal(err)
 			}
 		}
-		err = serve(*data, *addrL, *addr, *gib<<30, *workers, *shadow)
+		err = serve(*data, *addrL, *addr, *gib<<30, *workers)
 	case "import":
 		key := fl.String("key", "", "unit key (defaults to the source directory's name)")
-		gib := fl.Int64("max-gib", 0, "quota on unique CAS bytes, GiB, evicting LRU units to fit; 0 = unlimited")
+		gib := fl.Int64("max-gib", 0, "cap on stored bytes, GiB: least recently used units are evicted first to fit; 0 = unlimited")
 		fl.Parse(args)
 		if fl.NArg() != 1 {
 			log.Fatal("import: need exactly one source directory")
@@ -125,7 +118,7 @@ func main() {
 	}
 }
 
-func open(dir string, quota int64) (*meta.DB, *cas.Store, error) {
+func open(dir string) (*meta.DB, *store.Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, nil, err
 	}
@@ -133,58 +126,50 @@ func open(dir string, quota int64) (*meta.DB, *cas.Store, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	store, err := cas.Open(dir, quota)
+	st, err := store.Open(dir)
 	if err != nil {
 		db.Close()
 		return nil, nil, err
 	}
-	return db, store, nil
+	// Directories left by earlier versions: the CAS blob store, its debug
+	// shadow tree. A cache made with the CAS keeps its manifests and
+	// refaults its units into the file store as they are used.
+	for _, old := range []string{"blobs", "shadow"} {
+		if _, err := os.Stat(filepath.Join(dir, old)); err == nil {
+			log.Printf("note: %s is left from the old CAS store and is no longer used; remove it to free the space", filepath.Join(dir, old))
+		}
+	}
+	return db, st, nil
 }
 
-func serve(dir, addrL, addr string, max int64, workers int, shadow bool) error {
+func serve(dir, addrL, addr string, max int64, workers int) error {
 	if addrL == "" && addr == "" {
 		return fmt.Errorf("serve: no listen address")
 	}
-	db, store, err := open(dir, 0)
+	db, st, err := open(dir)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	defer store.Close()
+	defer st.Close()
 	spool, err := fill.OpenDiskSpool(filepath.Join(dir, "spool"))
 	if err != nil {
 		return err
 	}
-	quota := &fill.LocalQuota{Max: max, CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: spool.Bytes}
-	opts := fill.Options{Workers: workers}
-	if shadow {
-		opts.Shadow = filepath.Join(dir, shadowDir)
-		log.Printf("debug savings mode: shadow tree in %s (not counted by -max-gib)", opts.Shadow)
-	} else if _, err := os.Stat(filepath.Join(dir, shadowDir)); err == nil {
-		log.Printf("note: %s is left from a -debug-shadow run and is no longer kept up to date; remove it to free the space", filepath.Join(dir, shadowDir))
-	}
-	mgr, err := fill.NewManager(db, store, spool, quota, opts)
+	quota := &fill.LocalQuota{Max: max, Store: st.Used, Spool: spool.Bytes}
+	mgr, err := fill.NewManager(db, st, spool, quota, fill.Options{Workers: workers})
 	if err != nil {
 		return err
 	}
 	defer mgr.Close()
-	if shadow {
-		go func() {
-			if w, rm, err := mgr.SyncShadow(context.Background()); err != nil {
-				log.Printf("shadow: %v", err)
-			} else if w+rm > 0 {
-				log.Printf("shadow: wrote %d unit trees, removed %d", w, rm)
-			}
-		}()
-	}
 	idx, err := h9index.Open(context.Background(), db)
 	if err != nil {
 		return err
 	}
-	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr, Index: idx,
+	fs := &tree.FS{Meta: db, Store: st, Files: mgr, Faults: mgr, Index: idx,
 		Synthetic: map[string]tree.SyntheticFunc{
 			"usage": func(ctx context.Context) ([]byte, error) { return usageReport(ctx, db) },
-			"stats": func(ctx context.Context) ([]byte, error) { return statsReport(ctx, dir, db, store, mgr) },
+			"stats": func(ctx context.Context) ([]byte, error) { return statsReport(ctx, dir, db, st) },
 		}}
 	if err := fs.InitSynthetic(context.Background()); err != nil {
 		return err
@@ -198,7 +183,7 @@ func serve(dir, addrL, addr string, max int64, workers int, shadow bool) error {
 			return err
 		}
 	}
-	if err := startGC(db, store, mgr, quota, max, opts.Shadow); err != nil {
+	if err := startGC(db, st, mgr, quota, max); err != nil {
 		return err
 	}
 	if err := startUsage(context.Background(), db, mgr); err != nil {
@@ -242,29 +227,41 @@ func importDir(dir, key, src string, quota int64) error {
 		}
 		key = filepath.Base(abs)
 	}
-	db, store, err := open(dir, quota)
+	db, st, err := open(dir)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	// With a quota, a full CAS evicts least recently used units first.
-	if _, err := gc.New(context.Background(), db, store, gc.Config{Logf: log.Printf}); err != nil {
-		return err
-	}
-	before, _ := store.Usage()
-	start := time.Now()
-	res, err := ingest.ImportDir(context.Background(), db, store, "local", key, src)
+	ctx := context.Background()
+	c, err := gc.New(ctx, db, st, gc.Config{Max: quota, High: 1, Low: 1, Logf: log.Printf})
 	if err != nil {
 		return err
 	}
-	after, _ := store.Usage()
+	before := st.Used()
+	start := time.Now()
+	res, err := ingest.ImportDir(ctx, db, st, "local", key, src)
+	if err != nil {
+		return err
+	}
+	after := st.Used()
 	el := time.Since(start)
 	fmt.Printf("imported /local/%s: %d files, %d dirs, %d symlinks, %d hard links\n",
 		key, res.Files, res.Dirs, res.Symlinks, res.Hardlinks)
-	fmt.Printf("logical %s, new CAS bytes %s (%d new content objects), %v (%.1f MiB/s)\n",
+	fmt.Printf("logical %s, new stored bytes %s (%d new contents), %v (%.1f MiB/s)\n",
 		size(res.LogicalBytes), size(after-before), res.NewContents, el.Round(time.Millisecond),
 		float64(res.LogicalBytes)/(1<<20)/el.Seconds())
-	ix, err := indexer(db, store)
+	// With a cap, evict least recently used units (not this one) until the
+	// store fits.
+	if quota > 0 {
+		release := c.Acquire(res.Unit.ID)
+		defer release()
+		if freed, err := c.Collect(ctx); err != nil {
+			return err
+		} else if freed > 0 {
+			fmt.Printf("evicted to fit -max-gib: freed %s\n", size(freed))
+		}
+	}
+	ix, err := indexer(db, st)
 	if err != nil {
 		return err
 	}
@@ -283,12 +280,12 @@ var rootIndexer subsys.RootIndexer
 
 // indexer returns an h9index generator over the metadata, for commands
 // that run without the server.
-func indexer(db *meta.DB, store *cas.Store) (*h9index.Indexer, error) {
+func indexer(db *meta.DB, st *store.Store) (*h9index.Indexer, error) {
 	idx, err := h9index.Open(context.Background(), db)
 	if err != nil {
 		return nil, err
 	}
-	fs := &tree.FS{Meta: db, CAS: store, Index: idx}
+	fs := &tree.FS{Meta: db, Store: st, Index: idx}
 	return fs.Indexer(idx, ""), nil
 }
 
@@ -306,12 +303,12 @@ func printIndex(r h9index.Result) {
 // indexRoots generates /.h9index for the given roots, or with all for
 // every root that already has one.
 func indexRoots(dir string, all bool, roots []string) error {
-	db, store, err := open(dir, 0)
+	db, st, err := open(dir)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	ix, err := indexer(db, store)
+	ix, err := indexer(db, st)
 	if err != nil {
 		return err
 	}
@@ -335,20 +332,13 @@ func indexRoots(dir string, all bool, roots []string) error {
 	return nil
 }
 
-// shadowDir is the debug shadow tree, under the cache directory.
-const shadowDir = "shadow"
-
 func stats(dir string, asJSON bool, top int) error {
-	db, store, err := open(dir, 0)
+	db, st, err := open(dir)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	opts := savings.Options{Dir: dir, Top: top}
-	if _, err := os.Stat(filepath.Join(dir, shadowDir)); err == nil {
-		opts.Shadow = filepath.Join(dir, shadowDir)
-	}
-	r, err := savings.Measure(context.Background(), db, store, opts)
+	r, err := savings.Measure(context.Background(), db, st, savings.Options{Dir: dir, Top: top})
 	if err != nil {
 		return err
 	}
@@ -360,13 +350,9 @@ func stats(dir string, asJSON bool, top int) error {
 	return r.WriteText(os.Stdout)
 }
 
-// statsReport renders /.cache/stats, first bringing the shadow tree up to
-// date in the debug savings mode.
-func statsReport(ctx context.Context, dir string, db *meta.DB, store *cas.Store, mgr *fill.LocalManager) ([]byte, error) {
-	if _, _, err := mgr.SyncShadow(ctx); err != nil {
-		log.Printf("shadow: %v", err)
-	}
-	r, err := savings.Measure(ctx, db, store, savings.Options{Dir: dir, Shadow: mgr.ShadowDir()})
+// statsReport renders /.cache/stats.
+func statsReport(ctx context.Context, dir string, db *meta.DB, st *store.Store) ([]byte, error) {
+	r, err := savings.Measure(ctx, db, st, savings.Options{Dir: dir})
 	if err != nil {
 		return nil, err
 	}

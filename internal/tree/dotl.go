@@ -10,9 +10,9 @@ import (
 	"github.com/hugelgupf/p9/linux"
 	"github.com/hugelgupf/p9/p9"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
@@ -46,7 +46,7 @@ type lnode struct {
 	idx *h9index.File // set for a root's generated /.h9index
 
 	mu   sync.Mutex
-	file cas.File // open regular file
+	file store.File // open regular file
 
 	// readdir position cache: the entry after lastName is at lastOff
 	lastOff  uint64
@@ -194,7 +194,10 @@ func (n *lnode) StatFS() (p9.FSStat, error) {
 	if err != nil {
 		return p9.FSStat{}, linux.EIO
 	}
-	used, _ := n.fs.CAS.Usage()
+	var used int64
+	if n.fs.Store != nil {
+		used = n.fs.Store.Used()
+	}
 	return p9.FSStat{
 		Type:       0x01021997, // V9FS_MAGIC
 		BlockSize:  4096,

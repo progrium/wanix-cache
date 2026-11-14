@@ -16,20 +16,20 @@ import (
 	"9fans.net/go/plan9/client"
 	"github.com/hugelgupf/p9/p9"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
 
 type ixenv struct {
-	db    *meta.DB
-	store *cas.Store
-	idx   *h9index.Store
-	fs    *tree.FS
-	ix    *h9index.Indexer
+	db  *meta.DB
+	st  *store.Store
+	idx *h9index.Store
+	fs  *tree.FS
+	ix  *h9index.Indexer
 }
 
 // setupIndexed imports a small rootfs as /local/root and indexes it.
@@ -42,7 +42,7 @@ func setupIndexed(t *testing.T) *ixenv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	store, err := cas.Open(dir, 0)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,19 +64,19 @@ func setupIndexed(t *testing.T) *ixenv {
 	writeFile(t, filepath.Join(src, ".h9index"), []byte("a stale index shipped in the tree\n"))
 	os.MkdirAll(filepath.Join(src, "tmp"), 0o755)
 	os.Chmod(filepath.Join(src, "tmp"), 0o777)
-	if _, err := ingest.ImportDir(ctx, db, store, "local", "root", src); err != nil {
+	if _, err := ingest.ImportDir(ctx, db, st, "local", "root", src); err != nil {
 		t.Fatal(err)
 	}
 	idx, err := h9index.Open(ctx, db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs := &tree.FS{Meta: db, CAS: store, Index: idx}
+	fs := &tree.FS{Meta: db, Store: st, Index: idx}
 	ix := fs.Indexer(idx, "")
 	if _, err := ix.Index(ctx, "/local/root"); err != nil {
 		t.Fatal(err)
 	}
-	return &ixenv{db, store, idx, fs, ix}
+	return &ixenv{db, st, idx, fs, ix}
 }
 
 func serve9(t *testing.T, fs *tree.FS, aname string) *client.Fsys {

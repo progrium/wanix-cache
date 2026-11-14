@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
@@ -45,7 +45,7 @@ var busybox = (&fixturePkg{name: "busybox", version: "1.36.1-r29", arch: "x86_64
 type harness struct {
 	t      *testing.T
 	db     *meta.DB
-	store  *cas.Store
+	st     *store.Store
 	fs     *tree.FS
 	idx    *h9index.Store
 	mgr    *fill.LocalManager
@@ -64,7 +64,7 @@ func newHarness(t *testing.T, unpack bool) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := cas.Open(dir, 0)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,12 +72,12 @@ func newHarness(t *testing.T, unpack bool) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q := &fill.LocalQuota{CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: sp.Bytes}
-	mgr, err := fill.NewManager(db, store, sp, q, fill.Options{Logf: t.Logf})
+	q := &fill.LocalQuota{Store: st.Used, Spool: sp.Bytes}
+	mgr, err := fill.NewManager(db, st, sp, q, fill.Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{t: t, db: db, store: store, mgr: mgr, up: newUpstream(), clock: time.Unix(1_800_000_000, 0)}
+	h := &harness{t: t, db: db, st: st, mgr: mgr, up: newUpstream(), clock: time.Unix(1_800_000_000, 0)}
 	upSrv := httptest.NewServer(h.up)
 	h.up.set("/"+repo+"/APKINDEX.tar.gz", buildIndex(hello, busybox))
 	h.up.set("/"+repo+"/"+hello.nv()+".apk", hello.apk)
@@ -86,7 +86,7 @@ func newHarness(t *testing.T, unpack bool) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.fs = &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr, Index: idx}
+	h.fs = &tree.FS{Meta: db, Store: st, Files: mgr, Faults: mgr, Index: idx}
 	h.idx = idx
 	h.apk = New(db, Config{Upstream: upSrv.URL, Unpack: unpack, Logf: t.Logf, Indexer: h.fs.Indexer(idx, "")})
 	h.apk.now = func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.clock }

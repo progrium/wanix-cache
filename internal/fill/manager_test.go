@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
@@ -119,7 +119,7 @@ func (f *fakeSub) add(k subsys.Key, kv ...string) {
 type env struct {
 	dir   string
 	db    *meta.DB
-	store *cas.Store
+	st    *store.Store
 	spool *DiskSpool
 	quota *LocalQuota
 	m     *LocalManager
@@ -131,7 +131,7 @@ func newEnv(t *testing.T, dir string, max int64, opts Options) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := cas.Open(dir, 0)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,13 +139,13 @@ func newEnv(t *testing.T, dir string, max int64, opts Options) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q := &LocalQuota{Max: max, CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: sp.Bytes}
+	q := &LocalQuota{Max: max, Store: st.Used, Spool: sp.Bytes}
 	opts.Logf = t.Logf
-	m, err := NewManager(db, store, sp, q, opts)
+	m, err := NewManager(db, st, sp, q, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{dir: dir, db: db, store: store, spool: sp, quota: q, m: m}
+	e := &env{dir: dir, db: db, st: st, spool: sp, quota: q, m: m}
 	t.Cleanup(func() { m.Close(); db.Close() })
 	return e
 }
@@ -400,12 +400,12 @@ func TestQuota(t *testing.T) {
 	s.add("big", "f", string(make([]byte, 2000)))
 	s.add("small", "f", "tiny")
 	e.m.Register(ctx, s)
-	if _, err := e.m.Ensure(ctx, "fake", "big", true); !errors.Is(err, cas.ErrFull) {
+	if _, err := e.m.Ensure(ctx, "fake", "big", true); !errors.Is(err, store.ErrFull) {
 		t.Fatalf("over quota: got %v", err)
 	}
 	var asked int64
 	e.m.SetReclaimer(reclaimFunc(func(_ context.Context, n int64) (int64, error) { asked = n; return 0, nil }))
-	if _, err := e.m.Ensure(ctx, "fake", "big", true); !errors.Is(err, cas.ErrFull) || asked == 0 {
+	if _, err := e.m.Ensure(ctx, "fake", "big", true); !errors.Is(err, store.ErrFull) || asked == 0 {
 		t.Fatalf("reclaimer not asked (%d) or quota not enforced (%v)", asked, err)
 	}
 	if _, err := e.m.Ensure(ctx, "fake", "small", true); err != nil {

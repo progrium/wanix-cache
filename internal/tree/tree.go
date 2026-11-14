@@ -1,5 +1,5 @@
-// Package tree serves the metadata namespace with file bytes from the CAS,
-// in the shape the 9P server wants.
+// Package tree serves the metadata namespace with file bytes from the file
+// store, in the shape the 9P server wants.
 package tree
 
 import (
@@ -9,26 +9,26 @@ import (
 	"io"
 	"sync"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
-// FS adapts meta + cas to ninep.FS.
+// FS adapts meta + store to ninep.FS.
 //
 // Plain 9P2000 has no symlinks, so symlinks are stored in the metadata but
 // not shown over 9P yet: they are skipped in listings and do not resolve in
 // walks. How H9 wants them exposed is an open question.
 type FS struct {
-	Meta *meta.DB
-	CAS  *cas.Store
+	Meta  *meta.DB
+	Store *store.Store
 
 	// Files, if set, opens file bytes in any unit state (the fill path's
-	// spool or the CAS). Without it files are read from the CAS only.
+	// spool or the store). Without it files are read from the store only.
 	Files interface {
-		Open(ctx context.Context, in meta.Inode) (cas.File, error)
+		Open(ctx context.Context, in meta.Inode) (store.File, error)
 	}
 	// Faults, if set, is told about lookup misses so it can fault in the
 	// unit that holds the name. It reports whether to retry the lookup.
@@ -77,21 +77,21 @@ func (f *FS) lookup(ctx context.Context, dir uint64, name string) (meta.Inode, e
 }
 
 // open returns a file inode's bytes.
-func (f *FS) open(ctx context.Context, in meta.Inode) (cas.File, error) {
+func (f *FS) open(ctx context.Context, in meta.Inode) (store.File, error) {
 	if f.Files != nil {
 		return f.Files.Open(ctx, in)
 	}
 	if in.Content == "" {
 		return emptyFile{}, nil
 	}
-	return f.CAS.Open(ctx, in.Content)
+	return f.Store.Open(in.Unit, in.Ino)
 }
 
 var _ ninep.FS = (*FS)(nil)
 
 // node is how the 9P2000 server sees an inode. qid.vers is 0: a unit's
 // tree never changes in place (refetching produces the same tree), and a
-// version taken from the CAS ref would change when ingest sets the ref,
+// version taken from the content digest would change when ingest sets it,
 // which h9's index layer would see as a stale file.
 func node(in meta.Inode) ninep.Node {
 	n := ninep.Node{Ino: in.Ino, Dir: in.Kind == meta.KindDir, Mode: in.Mode, Size: in.Size, Mtime: in.Mtime}
@@ -201,7 +201,7 @@ func indexNode(x h9index.File) ninep.Node {
 }
 
 // openIndex returns the bytes of the index file numbered ino.
-func (f *FS) openIndex(ctx context.Context, ino uint64) (cas.File, error) {
+func (f *FS) openIndex(ctx context.Context, ino uint64) (store.File, error) {
 	dir, v, _ := h9index.IsFileIno(ino)
 	if f.Index == nil {
 		return nil, meta.ErrNotExist

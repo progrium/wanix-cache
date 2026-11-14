@@ -5,7 +5,7 @@
 // Three levels, each with daily buckets and running totals:
 //
 //	package  (subsystem, name, version)  opens, fetches, refetches, bytes
-//	object   CAS content ref             opens, bytes; one row per distinct
+//	object   content digest              opens, bytes; one row per distinct
 //	                                     file content, across every unit
 //	                                     and subsystem that contains it
 //	path     (subsystem, package, path)  opens, bytes; package is the

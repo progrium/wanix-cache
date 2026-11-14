@@ -9,11 +9,11 @@ import (
 	"time"
 )
 
-// UnitState is where a unit's bytes live. See docs/design.md.
+// UnitState is where a unit's bytes live.
 //
 //	absent   -> fetching            fault
 //	fetching -> spooled | absent    fill verified | fill failed
-//	spooled  -> resident            ingested into the CAS
+//	spooled  -> resident            ingested into the file store
 //	resident -> evicted             content evicted, manifest kept
 //	evicted  -> fetching            refault
 //	fetching -> evicted             refault failed (manifest still known)

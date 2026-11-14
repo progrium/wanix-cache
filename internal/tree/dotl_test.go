@@ -13,20 +13,20 @@ import (
 
 	"github.com/hugelgupf/p9/p9"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
 
-func setupL(t testing.TB) (*meta.DB, *cas.Store, p9.File) {
+func setupL(t testing.TB) (*meta.DB, *store.Store, p9.File) {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := meta.Open(filepath.Join(dir, "meta.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := cas.Open(dir, 0)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func setupL(t testing.TB) (*meta.DB, *cas.Store, p9.File) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go tree.NewDotLServer(&tree.FS{Meta: db, CAS: store}).Serve(ln)
+	go tree.NewDotLServer(&tree.FS{Meta: db, Store: st}).Serve(ln)
 	c, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +48,7 @@ func setupL(t testing.TB) (*meta.DB, *cas.Store, p9.File) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cl.Close(); ln.Close(); db.Close() })
-	return db, store, root
+	return db, st, root
 }
 
 func walk(t testing.TB, root p9.File, p string) p9.File {
@@ -81,7 +81,7 @@ func readL(t testing.TB, root p9.File, p string) []byte {
 
 func TestDotL(t *testing.T) {
 	ctx := context.Background()
-	db, store, root := setupL(t)
+	db, st, root := setupL(t)
 	src := t.TempDir()
 	big := random(2 << 20)
 	writeFile(t, filepath.Join(src, "lib", "libc.so.6"), big)
@@ -89,7 +89,7 @@ func TestDotL(t *testing.T) {
 	os.Symlink("libc.so.6", filepath.Join(src, "lib", "libc.so"))
 	os.Symlink("../lib", filepath.Join(src, "etc", "lib"))
 	os.Link(filepath.Join(src, "etc", "os-release"), filepath.Join(src, "etc", "os-release.hard"))
-	if _, err := ingest.ImportDir(ctx, db, store, "local", "rootfs", src); err != nil {
+	if _, err := ingest.ImportDir(ctx, db, st, "local", "rootfs", src); err != nil {
 		t.Fatal(err)
 	}
 

@@ -21,7 +21,7 @@ var Migrations = []meta.Migration{
 	// One generated index per root directory and variant. dir_mtime and
 	// dir_unit pin the row to the directory it was generated for, so a
 	// reused inode number never serves another tree's index. The text is
-	// kept here, not in the CAS: it is metadata, survives eviction with the
+	// kept here, not in the file store: it is metadata, survives eviction with the
 	// manifest, and is a few hundred bytes a name.
 	{Version: 1, SQL: `CREATE TABLE h9index_file (
 		dir       INTEGER NOT NULL,

@@ -1,7 +1,7 @@
 // Package fill defines the read-through fill path: faulting units in,
-// spooling them on plain disk, ingesting them into the CAS, and accounting
-// for the bytes in between. This file is the API other phases build against;
-// the implementation lands in a follow-up.
+// spooling them on plain disk, ingesting them into the file store, and
+// accounting for the bytes in between. The implementation is LocalManager
+// (manager.go).
 //
 // A fault runs:
 //
@@ -11,10 +11,11 @@
 //	                               file bytes are readable from the spool
 //	  digest checked               mismatch -> absent (or evicted), spool dropped
 //	  fetching -> spooled          spool fsynced; survives a crash
-//	  ingest workers               chunk spool files into the CAS
-//	  spooled -> resident          inode content refs set, spool removed
+//	  ingest workers               hash spool files; link each into the
+//	                               store, or to an identical stored file
+//	  spooled -> resident          inode content digests set, spool removed
 //
-// Eviction (phase 5) moves resident -> evicted through a Reclaimer the
+// Eviction moves resident -> evicted through a Reclaimer the
 // Manager calls when a reservation does not fit.
 package fill
 
@@ -23,8 +24,8 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
@@ -49,14 +50,14 @@ type Manager interface {
 
 	// Open returns a file's bytes in whatever state its unit is in: from the
 	// spool while fetching or spooled (reads past what has been written
-	// block until it is written or the fill fails), from the CAS when
+	// block until it is written or the fill fails), from the store when
 	// resident. An open handle pins the unit until Close.
-	Open(ctx context.Context, in meta.Inode) (cas.File, error)
+	Open(ctx context.Context, in meta.Inode) (store.File, error)
 
 	// OpenPath opens the file at rel (slash separated, inside the unit) of a
 	// unit, faulting the unit in and waiting for the entry if needed. For
 	// frontends that are not the 9P tree, such as the APK HTTP mirror.
-	OpenPath(ctx context.Context, sub string, key subsys.Key, rel string) (cas.File, meta.Inode, error)
+	OpenPath(ctx context.Context, sub string, key subsys.Key, rel string) (store.File, meta.Inode, error)
 
 	// WatchOpens registers fn to be called when a file is opened through
 	// Open or OpenPath and again when it is closed, for usage tracking. It
@@ -110,25 +111,26 @@ func IsInternal(ctx context.Context) bool {
 	return v
 }
 
-// Reclaimer frees CAS bytes by evicting units. The Manager calls it when a
+// Reclaimer frees stored bytes by evicting units. The Manager calls it when a
 // quota reservation does not fit, asking for at least need bytes. It must
 // not evict pinned units.
 type Reclaimer interface {
 	Reclaim(ctx context.Context, need int64) (freed int64, err error)
 }
 
-// Quota accounts for every byte the cache holds: unique CAS blob bytes,
-// spool bytes, and reservations for fills in progress.
+// Quota accounts for every byte the cache holds: stored file bytes (each
+// file once, however many links it has), spool bytes, and reservations for
+// fills in progress.
 type Quota interface {
 	// Reserve sets aside n bytes for a fill, calling the Reclaimer if they
-	// do not fit. It fails with cas.ErrFull if they still do not fit.
+	// do not fit. It fails with store.ErrFull if they still do not fit.
 	Reserve(ctx context.Context, n int64) (Reservation, error)
 	Usage() Usage
 }
 
 // Usage is a snapshot of the cache's accounted bytes.
 type Usage struct {
-	CAS, Spool, Reserved, Max int64
+	Store, Spool, Reserved, Max int64
 }
 
 // Reservation is quota held by one fill.
@@ -137,7 +139,7 @@ type Reservation interface {
 	// estimate (or had none).
 	Grow(ctx context.Context, n int64) error
 	// Release returns whatever the reservation still holds. Bytes that
-	// landed in the spool or the CAS are accounted there instead.
+	// landed in the spool or the store are accounted there instead.
 	Release()
 }
 
@@ -148,7 +150,7 @@ type Spool interface {
 	Create(unitID int64, ino uint64) (SpoolFile, error)
 	// Open reads a spool file, blocking on reads past the bytes written so
 	// far until they are written, the file is finished, or the fill fails.
-	Open(ino uint64) (cas.File, error)
+	Open(ino uint64) (store.File, error)
 	// Sync makes all of a unit's spool files durable (fetching -> spooled).
 	Sync(unitID int64) error
 	// Remove drops a unit's spool files after ingest or a failed fill.

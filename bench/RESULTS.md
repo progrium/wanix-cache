@@ -1,5 +1,11 @@
 # Phase 2: CAS reads against plain-disk reads
 
+> **History.** This compares the old Perkeep CAS with plain disk. The CAS
+> has since been removed: the cache now stores plain files with identical
+> files hard-linked (see the README's "Why plain files" and
+> `docs/perf-log.md`). The recommendation below was overtaken by the
+> savings runs, and `bench/cmd/readbench` no longer exists.
+
 **Recommendation: do not add a "hot units stay on plain disk" policy.**
 Make the CAS read path faster instead. Clients only read through 9P, and
 there the CAS costs 15–33% on warm whole-tree reads and 40–60% on cold ones.

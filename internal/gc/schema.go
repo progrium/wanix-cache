@@ -42,4 +42,12 @@ CREATE TABLE gc_pin (
 CREATE INDEX gc_content_ref ON content (ref);
 CREATE INDEX gc_unit_lru ON unit (state, last_access, id);
 `},
+	// The plain-file store replaced the CAS: a file's bytes are freed by the
+	// kernel when its last hard link goes, so blobs are no longer counted,
+	// and content.ref is the digest, which is already the key.
+	{Version: 2, SQL: `
+DROP TABLE gc_blob;
+DROP TABLE gc_content_blob;
+DROP INDEX gc_content_ref;
+`},
 }

@@ -3,7 +3,7 @@
 // A subsystem maps names in its part of the namespace to units, describes a
 // unit before fetching it, and streams a unit's contents into a Sink. The
 // core does everything else: single-flight faults, spooling, digest checks,
-// ingest into the CAS, accounting, eviction and serving.
+// ingest into the file store, accounting, eviction and serving.
 //
 // # Conventions for subsystem packages
 //

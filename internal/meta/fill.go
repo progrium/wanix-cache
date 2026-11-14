@@ -95,8 +95,8 @@ func (t *Tx) UpdateFile(ino uint64, mode uint32, size int64, mtime time.Time) er
 	return err
 }
 
-// SetContent sets a file inode's CAS ref ("" while its bytes are only in
-// the spool or evicted).
+// SetContent sets a file inode's content digest, once its bytes are in the
+// store ("" while they are only in the spool, or evicted).
 func (t *Tx) SetContent(ino uint64, ref string) error {
 	_, err := t.exec(`UPDATE inode SET content = ? WHERE ino = ?`, ref, ino)
 	return err

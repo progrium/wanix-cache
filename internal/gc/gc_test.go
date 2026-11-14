@@ -14,22 +14,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
 type env struct {
-	t     *testing.T
-	ctx   context.Context
-	dir   string
-	db    *meta.DB
-	store *cas.Store
-	c     *Collector
+	t   *testing.T
+	ctx context.Context
+	dir string
+	db  *meta.DB
+	st  *store.Store
+	c   *Collector
 }
 
-func newEnv(t *testing.T, quota int64, cfg Config) *env {
+func newEnv(t *testing.T, cfg Config) *env {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := meta.Open(filepath.Join(dir, "meta.db"))
@@ -37,18 +37,18 @@ func newEnv(t *testing.T, quota int64, cfg Config) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	store, err := cas.Open(dir, quota)
+	st, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = t.Logf
 	}
-	c, err := New(context.Background(), db, store, cfg)
+	c, err := New(context.Background(), db, st, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &env{t: t, ctx: context.Background(), dir: dir, db: db, store: store, c: c}
+	return &env{t: t, ctx: context.Background(), dir: dir, db: db, st: st, c: c}
 }
 
 // tree writes files (path -> bytes) under a new source directory.
@@ -68,7 +68,7 @@ func (e *env) tree(name string, files map[string][]byte) string {
 
 func (e *env) importDir(key, src string) meta.Unit {
 	e.t.Helper()
-	res, err := ingest.ImportDir(e.ctx, e.db, e.store, "local", key, src)
+	res, err := ingest.ImportDir(e.ctx, e.db, e.st, "local", key, src)
 	if err != nil {
 		e.t.Fatalf("import %s: %v", key, err)
 	}
@@ -103,7 +103,7 @@ func (e *env) read(p string) ([]byte, error) {
 	if in.Content == "" {
 		return nil, errors.New("no content (evicted)")
 	}
-	f, err := e.store.Open(e.ctx, in.Content)
+	f, err := e.st.Open(in.Unit, in.Ino)
 	if err != nil {
 		return nil, err
 	}
@@ -139,9 +139,34 @@ func (e *env) audit() AuditReport {
 	return rep
 }
 
-func (e *env) used() int64 {
-	u, _ := e.store.Usage()
+func (e *env) used() int64 { return e.st.Used() }
+
+// importFit imports a unit and then, like `wanix-cache import -max-gib`,
+// evicts least recently used units (not the new one) until usage fits
+// the collector's cap.
+func (e *env) importFit(key, src string) meta.Unit {
+	e.t.Helper()
+	u := e.importDir(key, src)
+	release := e.c.Acquire(u.ID)
+	defer release()
+	if _, err := e.c.Collect(e.ctx); err != nil {
+		e.t.Fatal(err)
+	}
 	return u
+}
+
+// sameFile reports whether two namespace paths are one file on disk.
+func (e *env) sameFile(p, q string) bool {
+	a, b := e.lookup(p), e.lookup(q)
+	fa, err := os.Stat(e.st.Path(a.Unit, a.Ino))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	fb, err := os.Stat(e.st.Path(b.Unit, b.Ino))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return os.SameFile(fa, fb)
 }
 
 func (e *env) touch(key string, at time.Time) {
@@ -157,8 +182,8 @@ func random(seed int64, n int) []byte {
 	return b
 }
 
-func TestEvictSweepRefault(t *testing.T) {
-	e := newEnv(t, 0, Config{})
+func TestEvictRefault(t *testing.T) {
+	e := newEnv(t, Config{})
 	shared := random(1, 300<<10)
 	onlyA := random(2, 200<<10)
 	onlyB := random(3, 100<<10)
@@ -167,8 +192,15 @@ func TestEvictSweepRefault(t *testing.T) {
 	e.importDir("a", srcA)
 	e.importDir("b", srcB)
 	e.audit()
+	// Identical files are one file on disk, within a unit and across units.
+	if !e.sameFile("/local/a/shared.bin", "/local/b/shared.bin") || !e.sameFile("/local/a/a.bin", "/local/a/dir/a-again.bin") {
+		t.Fatal("identical files are not hard-linked")
+	}
 
 	full := e.used()
+	if want := int64(len(shared) + len(onlyA) + len(onlyB)); full != want {
+		t.Fatalf("store holds %d bytes, want %d (each distinct file once)", full, want)
+	}
 	ex, err := e.c.Exclusive(e.ctx, e.unit("a").ID)
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +217,7 @@ func TestEvictSweepRefault(t *testing.T) {
 		t.Errorf("evict freed %d, exclusive said %d", freed, ex)
 	}
 	if got := e.used(); got != full-freed {
-		t.Errorf("CAS usage %d after freeing %d of %d", got, freed, full)
+		t.Errorf("store usage %d after freeing %d of %d", got, freed, full)
 	}
 	if s := e.unit("a").State; s != meta.UnitEvicted {
 		t.Fatalf("a is %v", s)
@@ -194,19 +226,19 @@ func TestEvictSweepRefault(t *testing.T) {
 	if in := e.lookup("/local/a/dir/a-again.bin"); in.Size != int64(len(onlyA)) || in.Content != "" {
 		t.Fatalf("evicted inode = %+v", in)
 	}
-	// B still reads the blob it shared with A.
+	// B still reads the file it shared with A.
 	e.mustRead("/local/b/shared.bin", shared)
 	e.mustRead("/local/b/b.bin", onlyB)
 	e.audit()
 
-	if _, err := ingest.RefaultDir(e.ctx, e.db, e.store, "local", "a", srcA); err != nil {
+	if _, err := ingest.RefaultDir(e.ctx, e.db, e.st, "local", "a", srcA); err != nil {
 		t.Fatal(err)
 	}
 	e.mustRead("/local/a/a.bin", onlyA)
 	e.mustRead("/local/a/dir/a-again.bin", onlyA)
 	e.mustRead("/local/a/shared.bin", shared)
 	if got := e.used(); got != full {
-		t.Errorf("CAS usage %d after refault, was %d", got, full)
+		t.Errorf("store usage %d after refault, was %d", got, full)
 	}
 	e.audit()
 
@@ -217,34 +249,27 @@ func TestEvictSweepRefault(t *testing.T) {
 		}
 	}
 	if got := e.used(); got != 0 {
-		t.Errorf("CAS still holds %d bytes with every unit evicted", got)
+		t.Errorf("store still holds %d bytes with every unit evicted", got)
 	}
 	rep := e.audit()
-	if rep.Blobs != 0 || rep.Contents != 0 {
-		t.Errorf("rows left: %d blobs, %d contents", rep.Blobs, rep.Contents)
+	if rep.DiskFiles != 0 || rep.Contents != 0 {
+		t.Errorf("left: %d files, %d contents", rep.DiskFiles, rep.Contents)
 	}
 }
 
-// Fill past the cap: older units are evicted to admit newer ones, and a
-// write fails only once nothing evictable remains.
+// Fill past the cap: older units are evicted to admit newer ones.
 func TestFillPastCap(t *testing.T) {
 	const unitSize = 256 << 10
-	e := newEnv(t, 0, Config{})
-	// Measure one unit's CAS cost to size the quota at about 3.5 units.
-	probe := newEnv(t, 0, Config{})
-	probe.importDir("p", probe.tree("p", map[string][]byte{"f": random(99, unitSize)}))
-	per := probe.used()
-	e = newEnv(t, per*7/2, Config{})
+	e := newEnv(t, Config{Max: unitSize * 7 / 2, High: 1, Low: 1})
 
 	srcs := map[string]string{}
 	for i := 0; i < 8; i++ {
 		k := string(rune('a' + i))
 		srcs[k] = e.tree(k, map[string][]byte{"f": random(int64(i), unitSize)})
-		e.importDir(k, srcs[k])
+		e.importFit(k, srcs[k])
 		e.touch(k, time.Unix(int64(1000+i), 0))
-		used, max := e.store.Usage()
-		if used > max {
-			t.Fatalf("after %s: usage %d over quota %d", k, used, max)
+		if used := e.used(); used > e.c.Max() {
+			t.Fatalf("after %s: usage %d over the cap %d", k, used, e.c.Max())
 		}
 	}
 	resident := 0
@@ -265,17 +290,22 @@ func TestFillPastCap(t *testing.T) {
 	e.mustRead("/local/h/f", random(7, unitSize))
 
 	// Refault the oldest: it evicts the least recently used resident unit.
-	if _, err := ingest.RefaultDir(e.ctx, e.db, e.store, "local", "a", srcs["a"]); err != nil {
+	u, err := ingest.RefaultDir(e.ctx, e.db, e.st, "local", "a", srcs["a"])
+	if err != nil {
 		t.Fatal(err)
 	}
+	release := e.c.Acquire(u.Unit.ID)
+	if _, err := e.c.Collect(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	release()
 	e.mustRead("/local/a/f", random(0, unitSize))
 	if s := e.unit("f").State; s != meta.UnitEvicted {
 		t.Errorf("f (least recently used) is %v, want evicted", s)
 	}
 	e.audit()
 
-	// Pin everything resident: now there is nothing to evict, and a write
-	// that does not fit fails.
+	// Pin everything resident: now there is nothing to evict.
 	us, _ := e.db.Units(e.ctx, "local")
 	for _, u := range us {
 		if u.State == meta.UnitResident {
@@ -284,21 +314,16 @@ func TestFillPastCap(t *testing.T) {
 			}
 		}
 	}
-	_, err := ingest.ImportDir(e.ctx, e.db, e.store, "local", "big", e.tree("big", map[string][]byte{"f": random(50, unitSize)}))
-	if !errors.Is(err, cas.ErrFull) {
-		t.Fatalf("import with everything pinned: %v, want ErrFull", err)
+	before := e.used()
+	e.importFit("big", e.tree("big", map[string][]byte{"f": random(50, unitSize)}))
+	if e.used() != before+unitSize {
+		t.Fatalf("with everything pinned, usage went from %d to %d", before, e.used())
 	}
-	// The failed import's blobs are orphans; the audit finds and removes them.
-	rep, err := e.c.Audit(e.ctx, AuditOptions{Fix: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("after failed import:\n%s", rep)
 	e.audit()
 }
 
 func TestWatermarks(t *testing.T) {
-	e := newEnv(t, 0, Config{})
+	e := newEnv(t, Config{})
 	for i := 0; i < 10; i++ {
 		k := string(rune('a' + i))
 		e.importDir(k, e.tree(k, map[string][]byte{"f": random(int64(i), 100<<10)}))
@@ -333,7 +358,7 @@ func TestWatermarks(t *testing.T) {
 // A unit whose bytes are all shared frees nothing, so a unit that frees
 // bytes goes first even if it was used more recently.
 func TestSharedUnitsGoLast(t *testing.T) {
-	e := newEnv(t, 0, Config{})
+	e := newEnv(t, Config{})
 	shared := random(1, 200<<10)
 	e.importDir("old-shared", e.tree("old-shared", map[string][]byte{"s": shared}))
 	e.importDir("holder", e.tree("holder", map[string][]byte{"s": shared}))
@@ -364,7 +389,7 @@ func TestSharedUnitsGoLast(t *testing.T) {
 
 func TestPins(t *testing.T) {
 	var pinned sync.Map
-	e := newEnv(t, 0, Config{Pinned: func(id int64) bool { _, ok := pinned.Load(id); return ok }})
+	e := newEnv(t, Config{Pinned: func(id int64) bool { _, ok := pinned.Load(id); return ok }})
 	for _, k := range []string{"index", "handle", "mem", "free"} {
 		e.importDir(k, e.tree(k, map[string][]byte{"f": random(int64(len(k)), 64<<10)}))
 	}
@@ -405,58 +430,39 @@ func TestPins(t *testing.T) {
 	e.audit()
 }
 
-// A doomed blob that an ingest dedups against must survive a sweep that
-// runs before the ingest commits.
-func TestSweepRaceWithIngest(t *testing.T) {
-	e := newEnv(t, 0, Config{})
+// An ingest that finds an identical file whose unit has just been evicted
+// stores its own copy.
+func TestLinkSourceGone(t *testing.T) {
+	e := newEnv(t, Config{})
 	data := random(5, 300<<10)
 	e.importDir("a", e.tree("a", map[string][]byte{"f": data}))
-	ref := e.lookup("/local/a/f").Content
-
-	// Evict without sweeping, so a's blobs are doomed but on disk.
-	e.c.mu.Lock()
-	if _, err := e.c.backfill(e.ctx); err != nil {
+	e.importDir("b", e.tree("b", map[string][]byte{"f": data}))
+	if !e.sameFile("/local/a/f", "/local/b/f") {
+		t.Fatal("not linked")
+	}
+	// Evicting a frees nothing: b still links the bytes.
+	if freed, err := e.c.Evict(e.ctx, e.unit("a").ID); err != nil || freed != 0 {
+		t.Fatalf("evict a freed %d, %v", freed, err)
+	}
+	e.mustRead("/local/b/f", data)
+	if e.used() != int64(len(data)) {
+		t.Fatalf("usage %d", e.used())
+	}
+	// b's file vanishes behind the metadata's back (as if b were being
+	// evicted while c looked it up): c stores its own copy.
+	in := e.lookup("/local/b/f")
+	if _, err := e.st.RemoveFile(in.Unit, in.Ino); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.c.evict(e.ctx, e.unit("a")); err != nil {
-		t.Fatal(err)
-	}
-	e.c.mu.Unlock()
-
-	// An ingest puts the same bytes: the writer finds every blob present
-	// and writes nothing, so only its session's holds protect them.
-	sess := e.store.Session()
-	got, err := sess.Put(e.ctx, bytes.NewReader(data))
-	if err != nil || got != ref {
-		t.Fatalf("put = %s, %v", got, err)
-	}
-	sw, err := e.c.Sweep(e.ctx)
+	e.importDir("c", e.tree("c", map[string][]byte{"f": data}))
+	e.mustRead("/local/c/f", data)
+	rep, err := e.c.Audit(e.ctx, AuditOptions{Fix: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sw.Blobs != 0 || sw.Held == 0 {
-		t.Fatalf("sweep with blobs held: %+v", sw)
+	if len(rep.BrokenUnits) != 1 || rep.BrokenUnits[0].Key != "b" {
+		t.Fatalf("audit:\n%s", rep)
 	}
-	// The ingest commits its reference, then closes the session.
-	tx, _ := e.db.Begin(e.ctx)
-	root, _ := tx.MkdirAll("/local/b")
-	id, _ := tx.CreateUnit("local", "b")
-	if _, err := tx.File(root, "f", 0o644, int64(len(data)), time.Now(), ref, id); err != nil {
-		t.Fatal(err)
-	}
-	tx.RefContent("sha256-test", ref, int64(len(data)))
-	tx.SetUnitState(id, meta.UnitAbsent, meta.UnitFetching)
-	tx.SetUnitState(id, meta.UnitFetching, meta.UnitSpooled)
-	tx.SetUnitState(id, meta.UnitSpooled, meta.UnitResident)
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	sess.Close()
-
-	if sw, err := e.c.Sweep(e.ctx); err != nil || sw.Blobs != 0 {
-		t.Fatalf("sweep after commit deleted %+v, %v", sw, err)
-	}
-	e.mustRead("/local/b/f", data)
 	e.audit()
 }
 
@@ -467,7 +473,7 @@ func TestConcurrentImportAndReclaim(t *testing.T) {
 		t.Skip("slow")
 	}
 	common := random(77, 128<<10)
-	e := newEnv(t, 2<<20, Config{})
+	e := newEnv(t, Config{Max: 2 << 20})
 	var wg sync.WaitGroup
 	errs := make(chan error, 64)
 	for w := 0; w < 4; w++ {
@@ -477,7 +483,7 @@ func TestConcurrentImportAndReclaim(t *testing.T) {
 			for i := 0; i < 6; i++ {
 				k := string(rune('a'+w)) + string(rune('0'+i))
 				src := e.tree(k, map[string][]byte{"common": common, "own": random(int64(w*100+i), 160<<10)})
-				if _, err := ingest.ImportDir(e.ctx, e.db, e.store, "local", k, src); err != nil {
+				if _, err := ingest.ImportDir(e.ctx, e.db, e.st, "local", k, src); err != nil {
 					errs <- err
 				}
 			}
@@ -494,24 +500,8 @@ func TestConcurrentImportAndReclaim(t *testing.T) {
 	}()
 	wg.Wait()
 	close(errs)
-	failed := 0
 	for err := range errs {
-		failed++
-		if !errors.Is(err, cas.ErrFull) {
-			t.Error(err)
-		}
-	}
-	if failed > 0 {
-		// An import that hit ErrFull leaves the blobs it wrote before the
-		// failure; they are orphans, which is what the audit is for.
-		rep, err := e.c.Audit(e.ctx, AuditOptions{Fix: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Logf("%d imports failed with ErrFull; repair:\n%s", failed, rep)
-		if rep.ContentRefsFixed+rep.BlobRefsFixed+len(rep.MissingBlobs)+len(rep.BrokenUnits) > 0 {
-			t.Fatalf("refcounts drifted under concurrency:\n%s", rep)
-		}
+		t.Error(err)
 	}
 	us, _ := e.db.Units(e.ctx, "local")
 	for _, u := range us {
@@ -524,79 +514,69 @@ func TestConcurrentImportAndReclaim(t *testing.T) {
 }
 
 func TestAuditRepairs(t *testing.T) {
-	e := newEnv(t, 0, Config{})
+	e := newEnv(t, Config{})
 	a := random(1, 200<<10)
 	b := random(2, 200<<10)
 	e.importDir("a", e.tree("a", map[string][]byte{"f": a}))
 	e.importDir("b", e.tree("b", map[string][]byte{"f": b}))
+	e.importDir("c", e.tree("c", map[string][]byte{"f": a}))
 	e.audit()
 	sqldb := e.db.SQL()
 
-	// Drift: wrong refcounts at both levels.
+	// Drift: wrong refcounts.
 	sqldb.Exec(`UPDATE content SET refs = refs + 5`)
-	sqldb.Exec(`UPDATE gc_blob SET refs = refs + 2 WHERE ref IN (SELECT ref FROM gc_blob LIMIT 1)`)
-	// An orphan: bytes on disk nothing references.
-	orphan, err := e.store.Put(e.ctx, bytes.NewReader(random(3, 50<<10)))
-	if err != nil {
+	// Leftovers: a directory of a unit that is not resident, and a file in
+	// a resident unit's directory that no inode uses.
+	if err := e.st.Write(999, 1, bytes.NewReader(random(3, 50<<10))); err != nil {
 		t.Fatal(err)
 	}
-	// Corruption: one of b's chunks deleted behind the GC's back.
-	bs, _ := e.store.Blobs(e.ctx, e.lookup("/local/b/f").Content)
-	var chunk string
-	for _, x := range bs {
-		if x.Ref != e.lookup("/local/b/f").Content {
-			chunk = x.Ref
-			break
-		}
-	}
-	if _, _, err := e.store.Remove(e.ctx, []string{chunk}, nil); err != nil {
+	if err := e.st.Write(e.unit("a").ID, 999, bytes.NewReader(random(4, 10<<10))); err != nil {
 		t.Fatal(err)
+	}
+	// Corruption: b's file deleted behind the GC's back.
+	in := e.lookup("/local/b/f")
+	if _, err := e.st.RemoveFile(in.Unit, in.Ino); err != nil {
+		t.Fatal(err)
+	}
+	// A copy: c's file stored separately from a's identical one.
+	in = e.lookup("/local/c/f")
+	if err := e.st.Write(in.Unit, in.Ino, bytes.NewReader(a)); err != nil {
+		t.Fatal(err)
+	}
+	if e.sameFile("/local/a/f", "/local/c/f") {
+		t.Fatal("still linked")
 	}
 
-	rep, err := e.c.Audit(e.ctx, AuditOptions{})
+	rep, err := e.c.Audit(e.ctx, AuditOptions{Deep: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("report:\n%s", rep)
-	if rep.ContentRefsFixed != 2 || rep.BlobRefsFixed != 1 || rep.Orphans == 0 ||
-		len(rep.MissingBlobs) != 1 || len(rep.BrokenUnits) != 1 || rep.BrokenUnits[0].Key != "b" {
+	if rep.ContentRefsFixed != 2 || rep.OrphanUnits != 1 || rep.OrphanFiles != 1 || rep.MissingFiles != 1 ||
+		rep.Duplicates != 1 || len(rep.BrokenUnits) != 1 || rep.BrokenUnits[0].Key != "b" {
 		t.Fatalf("audit missed something")
 	}
-	if _, err := e.store.Blobs(e.ctx, orphan); err != nil {
+	if _, err := os.Stat(e.st.Path(999, 1)); err != nil {
 		t.Fatal("report-only audit deleted the orphan")
 	}
 
+	before := e.used()
 	rep, err = e.c.Audit(e.ctx, AuditOptions{Fix: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.BrokenUnitsEvicted != 1 || rep.OrphansRemoved != rep.Orphans {
+	if rep.BrokenEvicted != 1 || rep.OrphansRemoved != 2 || rep.Relinked != 1 {
 		t.Fatalf("fix did not repair:\n%s", rep)
 	}
 	if s := e.unit("b").State; s != meta.UnitEvicted {
 		t.Errorf("broken unit b is %v, want evicted for refetch", s)
 	}
+	if !e.sameFile("/local/a/f", "/local/c/f") || e.used() != before-int64(len(a))-60<<10 {
+		t.Errorf("after fix: usage %d, was %d", e.used(), before)
+	}
 	e.mustRead("/local/a/f", a)
+	e.mustRead("/local/c/f", a)
 	e.audit()
-}
-
-// A database from before the GC existed: content rows with no blob lists
-// are tracked on first use.
-func TestBackfillPreexisting(t *testing.T) {
-	e := newEnv(t, 0, Config{})
-	e.importDir("a", e.tree("a", map[string][]byte{"f": random(1, 100<<10), "g": random(2, 10<<10)}))
-	e.db.SQL().Exec(`DELETE FROM gc_content_blob`)
-	e.db.SQL().Exec(`DELETE FROM gc_blob`)
-	rep := e.audit()
-	if rep.Backfilled != 2 {
-		t.Errorf("backfilled %d, want 2", rep.Backfilled)
-	}
-	if _, err := e.c.Evict(e.ctx, e.unit("a").ID); err != nil {
-		t.Fatal(err)
-	}
-	if e.used() != 0 {
-		t.Errorf("%d bytes left", e.used())
-	}
 }
 
 type hookSub struct {
@@ -640,7 +620,7 @@ func TestHooksAndOrder(t *testing.T) {
 		}
 		return out
 	}
-	e = newEnv(t, 0, Config{Subsystem: func(name string) (subsys.Subsystem, bool) { return h, name == "local" }})
+	e = newEnv(t, Config{Subsystem: func(name string) (subsys.Subsystem, bool) { return h, name == "local" }})
 	for i, k := range []string{"a", "b", "c"} {
 		e.importDir(k, e.tree(k, map[string][]byte{"f": random(int64(i), 64<<10)}))
 	}

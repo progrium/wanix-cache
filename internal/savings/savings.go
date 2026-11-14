@@ -1,11 +1,10 @@
-// Package savings measures what the CAS saves over plain disk: the debug
-// savings mode of phase 6, and the metrics of the savings test plan.
+// Package savings reports what the cache holds and what deduplication
+// saves: `wanix-cache stats` and /.cache/stats.
 //
-// It reads the metadata DB (which content each resident file has), the
-// CAS (which schema and data blobs each content object is made of, and the
-// blocks each blob file occupies) and, when the server runs with a shadow
-// tree, the shadow tree (every resident unit unpacked on plain disk with no
-// dedupe: baseline B2). Everything is per subsystem as well as in total.
+// It reads the metadata DB (which content digest each resident file has)
+// and walks the file store (the blocks each stored file occupies, counting
+// a hard-linked file once). Everything is per subsystem as well as in
+// total.
 //
 // Sizes are allocated bytes (st_blocks × 512) unless a field says logical.
 package savings
@@ -13,27 +12,20 @@ package savings
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io/fs"
 	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
-	"syscall"
 	"time"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 )
 
 // Options says where the cache lives.
 type Options struct {
-	// Dir is the cache directory (meta.db and blobs/).
+	// Dir is the cache directory (meta.db and files/).
 	Dir string
-	// Shadow is the shadow tree directory, or "" when the debug shadow is
-	// off; B2 is then left out.
-	Shadow string
 	// Top bounds the largest-exclusive-units and most-shared lists.
 	// Default 20.
 	Top int
@@ -43,6 +35,8 @@ type Options struct {
 type Report struct {
 	At         time.Time  `json:"at"`
 	Filesystem Filesystem `json:"filesystem"`
+	// Compression is the store's zstd level, 0 for plain files.
+	Compression int `json:"compression"`
 
 	Total       Totals      `json:"total"`
 	Subsystems  []Subsystem `json:"subsystems"`
@@ -50,9 +44,6 @@ type Report struct {
 
 	TopExclusiveUnits []UnitRow    `json:"top_exclusive_units"`
 	TopShared         []ContentRow `json:"top_shared_contents"`
-
-	// Broken counts content objects with blobs missing from the store.
-	Broken int `json:"broken_contents,omitempty"`
 }
 
 // Filesystem is the filesystem the cache directory is on.
@@ -61,94 +52,59 @@ type Filesystem struct {
 	BlockSize int64  `json:"block_size"`
 }
 
-// Plain is a plain-disk tree's size.
-type Plain struct {
-	Files     int64 `json:"files"`     // distinct inodes
-	Logical   int64 `json:"logical"`   // file bytes
-	Allocated int64 `json:"allocated"` // files, directories and symlinks
-	Units     int   `json:"units"`     // unit trees present
-}
-
 // Totals is the whole cache.
 type Totals struct {
 	Units   int   `json:"resident_units"`
 	Files   int64 `json:"files"`   // file inodes in resident units
 	Logical int64 `json:"logical"` // their bytes
 
-	Contents     int64 `json:"contents"`      // distinct content objects
+	Contents     int64 `json:"contents"`      // distinct content digests
 	ContentBytes int64 `json:"content_bytes"` // their logical bytes
 
-	DataBlobs   int64 `json:"data_blobs"`   // unique chunks reached from live content
-	DataBytes   int64 `json:"data_bytes"`   // logical
-	SchemaBlobs int64 `json:"schema_blobs"` // file and bytes schemas
-	SchemaBytes int64 `json:"schema_bytes"` // logical
+	StoreFiles     int64 `json:"store_files"`     // distinct files on disk
+	StoreLinks     int64 `json:"store_links"`     // names in unit directories
+	StoreBytes     int64 `json:"store_bytes"`     // stored bytes, each file once
+	StoreAllocated int64 `json:"store_allocated"` // files and directories
+	StoreDirs      int64 `json:"store_dirs"`
+	StoreDirBytes  int64 `json:"store_dir_allocated"`
+	// Copies are stored files beyond one per distinct content: identical
+	// files that were not hard-linked (`wanix-cache audit -fix` links them).
+	Copies     int64 `json:"copies"`
+	CopyBytes  int64 `json:"copy_bytes"`
+	DB         int64 `json:"db"`    // meta.db and its WAL
+	CacheTotal int64 `json:"total"` // StoreAllocated + DB
 
-	Blobs          int64 `json:"blobs"`           // every blob file on disk
-	BlobBytes      int64 `json:"blob_bytes"`      // logical
-	BlobAllocated  int64 `json:"blob_allocated"`  // allocated
-	StoreAllocated int64 `json:"store_allocated"` // blob files and the store's directories
-	// StoreDirs are localdisk's hash-prefix directories (sha224/xx/yy),
-	// one block each: overhead on top of BlobOverhead.
-	StoreDirs         int64 `json:"store_dirs"`
-	StoreDirAllocated int64 `json:"store_dir_allocated"`
-	// Unreferenced blobs are on disk but reached from no resident unit's
-	// content: evicted units' blobs waiting for a sweep.
-	UnreferencedBlobs int64 `json:"unreferenced_blobs"`
-	UnreferencedBytes int64 `json:"unreferenced_bytes"`
-	DB                int64 `json:"db"` // meta.db and its WAL
-
-	// CASTotal is the cache's real footprint: StoreAllocated + DB.
-	CASTotal int64 `json:"cas_total"`
-	// BlobOverhead is what one file per blob costs: BlobAllocated −
-	// BlobBytes.
-	BlobOverhead int64 `json:"blob_overhead"`
-
-	// B2 is the shadow tree: every unit unpacked, no dedupe. Nil when the
-	// shadow is off.
-	B2 *Plain `json:"b2,omitempty"`
-	// B3Estimate approximates B2 with identical files hard-linked: each
-	// distinct content once, rounded up to the block size, plus B2's
-	// directories and symlinks. Running rdfind or nix-store --optimise over
-	// a copy of the shadow gives the measured B3.
-	B3Estimate int64 `json:"b3_estimate"`
+	// NoDedupe estimates the same files with no hard links: every file
+	// inode rounded up to the block size, plus the store's directories.
+	NoDedupe int64 `json:"no_dedupe_estimate"`
 
 	Ratios Ratios `json:"ratios"`
 }
 
-// Ratios are fractions in [0, 1] (negative when the CAS is bigger).
+// Ratios are fractions in [0, 1].
 type Ratios struct {
 	// WholeFileDedupe is 1 − ContentBytes ÷ Logical.
 	WholeFileDedupe float64 `json:"whole_file_dedupe"`
-	// ChunkDedupe is 1 − DataBytes ÷ ContentBytes: what chunking adds.
-	ChunkDedupe float64 `json:"chunk_dedupe"`
-	// SchemaShare is SchemaBytes ÷ CASTotal.
-	SchemaShare float64 `json:"schema_share"`
-	// BlobOverheadShare is BlobOverhead ÷ CASTotal.
-	BlobOverheadShare float64 `json:"blob_overhead_share"`
-	// StoreDirShare is StoreDirAllocated ÷ CASTotal.
-	StoreDirShare float64 `json:"store_dir_share"`
-	// SavingsB2 is 1 − CASTotal ÷ B2.Allocated; 0 without a shadow.
-	SavingsB2 float64 `json:"savings_vs_b2"`
-	// SavingsB3Estimate is 1 − CASTotal ÷ B3Estimate.
-	SavingsB3Estimate float64 `json:"savings_vs_b3_estimate"`
-	// SavingsLogical is 1 − CASTotal ÷ Logical, for when there is no
-	// shadow. It ignores the plain filesystem's own block overhead.
-	SavingsLogical float64 `json:"savings_vs_logical"`
+	// Compression is 1 − StoreBytes ÷ ContentBytes (0 without zstd).
+	Compression float64 `json:"compression"`
+	// DirShare is StoreDirBytes ÷ CacheTotal.
+	DirShare float64 `json:"dir_share"`
+	// SavingsNoDedupe is 1 − StoreAllocated ÷ NoDedupe.
+	SavingsNoDedupe float64 `json:"savings_vs_no_dedupe"`
 }
 
-// Subsystem is one subsystem's share. A blob is exclusive to a subsystem
-// when only that subsystem's resident files reach it, and shared when
-// several do. Attributed splits each shared blob evenly between the
-// subsystems that reach it, so the subsystems' Attributed sum to the blob
-// files' allocated bytes (the DB and store directories are not split).
+// Subsystem is one subsystem's share. A content is exclusive to a
+// subsystem when only that subsystem's resident files have it, and shared
+// when several do. Attributed splits each shared file evenly between the
+// subsystems that have it, so the subsystems' Attributed sum to the stored
+// files' allocated bytes (the DB and directories are not split).
 type Subsystem struct {
 	Name    string `json:"name"`
 	Units   int    `json:"resident_units"`
 	Files   int64  `json:"files"`
 	Logical int64  `json:"logical"`
 
-	ContentBytes int64 `json:"content_bytes"` // distinct content it reaches, logical
-	DataBytes    int64 `json:"data_bytes"`    // unique chunks it reaches, logical
+	ContentBytes int64 `json:"content_bytes"` // distinct content it has, logical
 
 	ExclusiveBytes     int64            `json:"exclusive_bytes"` // logical
 	ExclusiveAllocated int64            `json:"exclusive_allocated"`
@@ -157,30 +113,23 @@ type Subsystem struct {
 	SharedWith         map[string]int64 `json:"shared_with,omitempty"` // logical bytes shared with each other subsystem
 	Attributed         int64            `json:"attributed"`
 
-	B2 *Plain `json:"b2,omitempty"`
-
 	WholeFileDedupe float64 `json:"whole_file_dedupe"`
-	ChunkDedupe     float64 `json:"chunk_dedupe"`
-	SavingsB2       float64 `json:"savings_vs_b2"` // 1 − Attributed ÷ B2.Allocated
 }
 
-// SizeClass groups distinct content objects by size. Each blob counts in
-// the class of the first content (in ref order) that uses it. Slack is the
-// blob files' allocated bytes minus their logical bytes: the per-blob file
-// overhead that packing small blobs together would remove.
+// SizeClass groups distinct contents by size. Slack is the stored files'
+// allocated bytes minus their stored bytes: what one file per content
+// costs in partly used blocks.
 type SizeClass struct {
-	Label       string  `json:"label"`
-	Max         int64   `json:"max"` // exclusive upper bound; 0 for the last class
-	Contents    int64   `json:"contents"`
-	Bytes       int64   `json:"bytes"` // logical
-	Blobs       int64   `json:"blobs"`
-	SchemaBytes int64   `json:"schema_bytes"`
-	Allocated   int64   `json:"allocated"`
-	Slack       int64   `json:"slack"`
-	SlackShare  float64 `json:"slack_share"` // of all slack
+	Label      string  `json:"label"`
+	Max        int64   `json:"max"` // exclusive upper bound; 0 for the last class
+	Contents   int64   `json:"contents"`
+	Bytes      int64   `json:"bytes"` // logical
+	Allocated  int64   `json:"allocated"`
+	Slack      int64   `json:"slack"`
+	SlackShare float64 `json:"slack_share"` // of all slack
 }
 
-// UnitRow is a unit and the blob bytes only it reaches.
+// UnitRow is a unit and the bytes only it has.
 type UnitRow struct {
 	Subsystem string `json:"subsystem"`
 	Key       string `json:"key"`
@@ -188,9 +137,9 @@ type UnitRow struct {
 	Exclusive int64  `json:"exclusive_allocated"`
 }
 
-// ContentRow is a content object shared by many files.
+// ContentRow is a content shared by many files.
 type ContentRow struct {
-	Ref        string   `json:"ref"`
+	Digest     string   `json:"digest"`
 	Size       int64    `json:"size"`
 	Files      int64    `json:"files"`
 	Units      int      `json:"units"`
@@ -213,32 +162,29 @@ func classOf(size int64) int {
 }
 
 type content struct {
-	size   int64
-	subs   uint64 // bitmask of subsystem indexes
-	unit   int64  // first unit that reaches it
-	multi  bool   // reached by more than one unit
-	files  int64
-	units  map[int64]bool
-	anyIno uint64
+	size  int64
+	subs  uint64 // bitmask of subsystem indexes
+	unit  int64  // first unit that has it
+	multi bool   // in more than one unit
+	files int64
+	units map[int64]bool
+	ino   uint64 // a file inode with it, in unit
+	alloc int64  // allocated bytes of its stored file
 }
 
-type blobInfo struct {
-	size   int64
-	schema bool
-	subs   uint64
-	unit   int64
-	multi  bool
-	class  int
+type fileKey struct {
+	unit int64
+	ino  uint64
 }
 
 // Measure builds a report. It reads the DB and the store while the server
-// runs; numbers taken mid-fill are a snapshot, so the test plan measures
-// after the cache settles.
-func Measure(ctx context.Context, db *meta.DB, store *cas.Store, opts Options) (*Report, error) {
+// runs; numbers taken mid-fill are a snapshot, so the savings plan
+// measures after the cache settles.
+func Measure(ctx context.Context, db *meta.DB, st *store.Store, opts Options) (*Report, error) {
 	if opts.Top <= 0 {
 		opts.Top = 20
 	}
-	r := &Report{At: time.Now().UTC(), Filesystem: filesystem(opts.Dir)}
+	r := &Report{At: time.Now().UTC(), Filesystem: filesystem(opts.Dir), Compression: st.Compression()}
 	bs := r.Filesystem.BlockSize
 
 	// Resident units and their files.
@@ -274,10 +220,10 @@ func Measure(ctx context.Context, db *meta.DB, store *cas.Store, opts Options) (
 		var (
 			ino    uint64
 			size   int64
-			ref    string
+			digest string
 			unitID int64
 		)
-		if err := rows.Scan(&ino, &size, &ref, &unitID); err != nil {
+		if err := rows.Scan(&ino, &size, &digest, &unitID); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -291,13 +237,14 @@ func Measure(ctx context.Context, db *meta.DB, store *cas.Store, opts Options) (
 		s.Logical += size
 		r.Total.Files++
 		r.Total.Logical += size
-		if ref == "" {
+		r.Total.NoDedupe += roundUp(size, bs)
+		if digest == "" {
 			continue // empty file
 		}
-		c := contents[ref]
+		c := contents[digest]
 		if c == nil {
-			c = &content{size: size, unit: unitID, units: map[int64]bool{}, anyIno: ino}
-			contents[ref] = c
+			c = &content{size: size, unit: unitID, units: map[int64]bool{}, ino: ino}
+			contents[digest] = c
 		}
 		c.subs |= 1 << si
 		c.files++
@@ -311,110 +258,71 @@ func Measure(ctx context.Context, db *meta.DB, store *cas.Store, opts Options) (
 		return nil, err
 	}
 
-	// Blobs of each content object.
-	refs := make([]string, 0, len(contents))
-	for ref := range contents {
-		refs = append(refs, ref)
-	}
-	sort.Strings(refs)
-	blobs := map[string]*blobInfo{}
-	for _, ref := range refs {
-		c := contents[ref]
-		r.Total.Contents++
-		r.Total.ContentBytes += c.size
-		forEach(c.subs, func(i int) { subs[i].ContentBytes += c.size })
-		cl := classOf(c.size)
-		schemas, data, err := store.Parts(ctx, ref)
-		if err != nil {
-			if errors.Is(err, cas.ErrMissing) || errors.Is(err, os.ErrNotExist) {
-				r.Broken++
-				continue
-			}
-			return nil, fmt.Errorf("savings: content %s: %w", ref, err)
-		}
-		add := func(b cas.Blob, schema bool) {
-			bi := blobs[b.Ref]
-			if bi == nil {
-				bi = &blobInfo{size: b.Size, schema: schema, unit: c.unit, multi: c.multi, class: cl}
-				blobs[b.Ref] = bi
-			} else if bi.unit != c.unit || c.multi {
-				bi.multi = true
-			}
-			bi.subs |= c.subs
-		}
-		for _, b := range schemas {
-			add(b, true)
-		}
-		for _, b := range data {
-			add(b, false)
-		}
-	}
-
-	// Blob files on disk.
-	onDisk := map[string]cas.BlobFile{}
-	du, err := store.DiskUsage(func(f cas.BlobFile) { onDisk[f.Ref] = f })
+	// The store on disk.
+	alloc := map[fileKey]int64{}
+	du, err := st.DiskUsage(func(e store.Entry) { alloc[fileKey{e.Unit, e.Ino}] = e.Allocated })
 	if err != nil {
 		return nil, err
 	}
-	r.Total.StoreAllocated, r.Total.StoreDirs, r.Total.StoreDirAllocated = du.Allocated, du.Dirs, du.DirAllocated
-	for ref, f := range onDisk {
-		r.Total.Blobs++
-		r.Total.BlobBytes += f.Size
-		r.Total.BlobAllocated += f.Allocated
-		if blobs[ref] == nil {
-			r.Total.UnreferencedBlobs++
-			r.Total.UnreferencedBytes += f.Size
-		}
-	}
+	t := &r.Total
+	t.StoreFiles, t.StoreLinks, t.StoreBytes = du.Files, du.Links, du.Bytes
+	t.StoreAllocated, t.StoreDirs, t.StoreDirBytes = du.Allocated, du.Dirs, du.DirAllocated
+	t.NoDedupe += du.DirAllocated
+	t.DB = dbSize(opts.Dir)
+	t.CacheTotal = t.StoreAllocated + t.DB
 
-	// Attribute blobs to subsystems, units and size classes.
+	// Attribute contents to subsystems, units and size classes.
+	digests := make([]string, 0, len(contents))
+	for d := range contents {
+		digests = append(digests, d)
+	}
+	sort.Strings(digests)
 	sc := make([]SizeClass, len(classes))
 	for i, c := range classes {
 		sc[i].Label, sc[i].Max = c.label, c.max
 	}
-	for _, c := range contents {
+	unitExcl := map[int64]int64{}
+	var contentAlloc int64
+	for _, d := range digests {
+		c := contents[d]
+		c.alloc = alloc[fileKey{c.unit, c.ino}]
+		contentAlloc += c.alloc
+		t.Contents++
+		t.ContentBytes += c.size
 		k := classOf(c.size)
 		sc[k].Contents++
 		sc[k].Bytes += c.size
-	}
-	unitExcl := map[int64]int64{}
-	for ref, b := range blobs {
-		alloc := b.size
-		if f, ok := onDisk[ref]; ok {
-			alloc = f.Allocated
+		sc[k].Allocated += c.alloc
+		stored := c.size
+		if r.Compression > 0 {
+			stored = c.alloc // the stored size is not tracked per file
 		}
-		if b.schema {
-			r.Total.SchemaBlobs++
-			r.Total.SchemaBytes += b.size
-			sc[b.class].SchemaBytes += b.size
-		} else {
-			r.Total.DataBlobs++
-			r.Total.DataBytes += b.size
-			forEach(b.subs, func(i int) { subs[i].DataBytes += b.size })
-		}
-		sc[b.class].Blobs++
-		sc[b.class].Allocated += alloc
-		sc[b.class].Slack += alloc - b.size
-		n := bits.OnesCount64(b.subs)
-		forEach(b.subs, func(i int) {
+		sc[k].Slack += max(c.alloc-stored, 0)
+		n := bits.OnesCount64(c.subs)
+		forEach(c.subs, func(i int) {
 			s := subs[i]
-			s.Attributed += alloc / int64(n)
+			s.ContentBytes += c.size
+			s.Attributed += c.alloc / int64(n)
 			if n == 1 {
-				s.ExclusiveBytes += b.size
-				s.ExclusiveAllocated += alloc
+				s.ExclusiveBytes += c.size
+				s.ExclusiveAllocated += c.alloc
 				return
 			}
-			s.SharedBytes += b.size
-			s.SharedAllocated += alloc
-			forEach(b.subs, func(j int) {
+			s.SharedBytes += c.size
+			s.SharedAllocated += c.alloc
+			forEach(c.subs, func(j int) {
 				if j != i {
-					s.SharedWith[subs[j].Name] += b.size
+					s.SharedWith[subs[j].Name] += c.size
 				}
 			})
 		})
-		if !b.multi {
-			unitExcl[b.unit] += alloc
+		if !c.multi {
+			unitExcl[c.unit] += c.alloc
 		}
+	}
+	if t.StoreFiles > t.Contents {
+		t.Copies = t.StoreFiles - t.Contents
+		t.CopyBytes = max(t.StoreAllocated-t.StoreDirBytes-contentAlloc, 0)
 	}
 	var slack int64
 	for _, c := range sc {
@@ -425,51 +333,16 @@ func Measure(ctx context.Context, db *meta.DB, store *cas.Store, opts Options) (
 	}
 	r.SizeClasses = sc
 
-	r.Total.DB = dbSize(opts.Dir)
-	r.Total.CASTotal = r.Total.StoreAllocated + r.Total.DB
-	r.Total.BlobOverhead = r.Total.BlobAllocated - r.Total.BlobBytes
-
-	// The shadow tree (B2) and the hard-link estimate (B3).
-	var b2Other int64
-	if opts.Shadow != "" {
-		r.Total.B2 = &Plain{}
-		for _, s := range subs {
-			p, other, err := plainSize(filepath.Join(opts.Shadow, s.Name), unitByID)
-			if err != nil {
-				return nil, err
-			}
-			s.B2 = p
-			r.Total.B2.Files += p.Files
-			r.Total.B2.Logical += p.Logical
-			r.Total.B2.Allocated += p.Allocated
-			r.Total.B2.Units += p.Units
-			b2Other += other
-		}
-	}
-	r.Total.B3Estimate = b2Other
-	for _, c := range contents {
-		r.Total.B3Estimate += roundUp(c.size, bs)
-	}
-
-	t := &r.Total
 	t.Ratios = Ratios{
-		WholeFileDedupe:   1 - ratio(t.ContentBytes, t.Logical),
-		ChunkDedupe:       1 - ratio(t.DataBytes, t.ContentBytes),
-		SchemaShare:       ratio(t.SchemaBytes, t.CASTotal),
-		BlobOverheadShare: ratio(t.BlobOverhead, t.CASTotal),
-		StoreDirShare:     ratio(t.StoreDirAllocated, t.CASTotal),
-		SavingsB3Estimate: savings(t.CASTotal, t.B3Estimate),
-		SavingsLogical:    savings(t.CASTotal, t.Logical),
+		WholeFileDedupe: 1 - ratio(t.ContentBytes, t.Logical),
+		DirShare:        ratio(t.StoreDirBytes, t.CacheTotal),
+		SavingsNoDedupe: savings(t.StoreAllocated, t.NoDedupe),
 	}
-	if t.B2 != nil {
-		t.Ratios.SavingsB2 = savings(t.CASTotal, t.B2.Allocated)
+	if r.Compression > 0 {
+		t.Ratios.Compression = 1 - ratio(t.StoreBytes, t.ContentBytes)
 	}
 	for _, s := range subs {
 		s.WholeFileDedupe = 1 - ratio(s.ContentBytes, s.Logical)
-		s.ChunkDedupe = 1 - ratio(s.DataBytes, s.ContentBytes)
-		if s.B2 != nil {
-			s.SavingsB2 = savings(s.Attributed, s.B2.Allocated)
-		}
 		if len(s.SharedWith) == 0 {
 			s.SharedWith = nil
 		}
@@ -492,10 +365,10 @@ func Measure(ctx context.Context, db *meta.DB, store *cas.Store, opts Options) (
 	if len(r.TopExclusiveUnits) > opts.Top {
 		r.TopExclusiveUnits = r.TopExclusiveUnits[:opts.Top]
 	}
-	shared := make([]string, 0)
-	for _, ref := range refs {
-		if contents[ref].files > 1 {
-			shared = append(shared, ref)
+	var shared []string
+	for _, d := range digests {
+		if contents[d].files > 1 {
+			shared = append(shared, d)
 		}
 	}
 	sort.SliceStable(shared, func(i, j int) bool {
@@ -508,9 +381,9 @@ func Measure(ctx context.Context, db *meta.DB, store *cas.Store, opts Options) (
 	if len(shared) > opts.Top {
 		shared = shared[:opts.Top]
 	}
-	for _, ref := range shared {
-		c := contents[ref]
-		row := ContentRow{Ref: ref, Size: c.size, Files: c.files, Units: len(c.units), Path: pathOf(ctx, db, c.anyIno)}
+	for _, d := range shared {
+		c := contents[d]
+		row := ContentRow{Digest: d, Size: c.size, Files: c.files, Units: len(c.units), Path: pathOf(ctx, db, c.ino)}
 		forEach(c.subs, func(i int) { row.Subsystems = append(row.Subsystems, subs[i].Name) })
 		sort.Strings(row.Subsystems)
 		r.TopShared = append(r.TopShared, row)
@@ -533,11 +406,11 @@ func ratio(a, b int64) float64 {
 	return float64(a) / float64(b)
 }
 
-func savings(cas, baseline int64) float64 {
+func savings(have, baseline int64) float64 {
 	if baseline == 0 {
 		return 0
 	}
-	return 1 - float64(cas)/float64(baseline)
+	return 1 - float64(have)/float64(baseline)
 }
 
 func roundUp(n, bs int64) int64 {
@@ -547,61 +420,11 @@ func roundUp(n, bs int64) int64 {
 	return (n + bs - 1) / bs * bs
 }
 
-// plainSize measures one subsystem's shadow trees. Hard-linked inodes count
-// once. other is the allocated bytes of everything but regular files.
-func plainSize(dir string, units map[int64]meta.Unit) (p *Plain, other int64, err error) {
-	p = &Plain{}
-	ents, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return p, 0, nil
-	} else if err != nil {
-		return nil, 0, err
-	}
-	type key struct{ dev, ino uint64 }
-	seen := map[key]bool{}
-	for _, e := range ents {
-		id, err := strconv.ParseInt(e.Name(), 10, 64)
-		if _, ok := units[id]; err != nil || !ok {
-			continue // a partial tree, or a unit no longer resident
-		}
-		p.Units++
-		err = filepath.WalkDir(filepath.Join(dir, e.Name()), func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			if st, ok := info.Sys().(*syscall.Stat_t); ok {
-				k := key{uint64(st.Dev), uint64(st.Ino)}
-				if seen[k] {
-					return nil
-				}
-				seen[k] = true
-			}
-			a := cas.Allocated(info)
-			p.Allocated += a
-			if info.Mode().IsRegular() {
-				p.Files++
-				p.Logical += info.Size()
-			} else {
-				other += a
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, 0, err
-		}
-	}
-	return p, other, nil
-}
-
 func dbSize(dir string) int64 {
 	var n int64
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		if info, err := os.Stat(filepath.Join(dir, "meta.db"+suffix)); err == nil {
-			n += cas.Allocated(info)
+			n += store.Allocated(info)
 		}
 	}
 	return n

@@ -11,8 +11,8 @@ import (
 	"9fans.net/go/plan9"
 	"github.com/hugelgupf/p9/p9"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
 
@@ -24,9 +24,9 @@ func TestSynthetic(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	store, _ := cas.Open(dir, 0)
+	st, _ := store.Open(dir)
 	var calls atomic.Int32
-	fs := &tree.FS{Meta: db, CAS: store, Synthetic: map[string]tree.SyntheticFunc{
+	fs := &tree.FS{Meta: db, Store: st, Synthetic: map[string]tree.SyntheticFunc{
 		"usage": func(context.Context) ([]byte, error) {
 			calls.Add(1)
 			return []byte("usage report\n"), nil

@@ -1,38 +1,38 @@
 # wanix-cache
 
-A local read-through cache for H9 guests. Cached content lives in one
-Perkeep content-addressed blob store, so identical files and chunks are
-stored once across every subsystem (APK, OCI, Nix). Clients see a
-**read-only** filesystem over 9P2000.L (Linux guests) and, optionally, plain
-9P2000.
+A local read-through cache for H9 guests. Cached content is stored as plain
+files, and identical files are hard-linked together, so a file is stored
+once across every subsystem (APK, OCI, Nix). Clients see a **read-only**
+filesystem over 9P2000.L (Linux guests) and, optionally, plain 9P2000.
 
-This is phase 1 of the plan: the core namespace, the CAS, and the 9P
-servers. Fetching from upstream, the spool and async ingest, eviction and GC,
-the debug savings mode, and the subsystems come in later phases.
+There is no content-addressed blob store. An earlier version kept content
+in a chunking Perkeep CAS; it was replaced because plain files with
+hard-link dedupe read faster and the CAS saved little space on top of them
+(see [Why plain files](#why-plain-files)).
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `internal/meta` | SQLite metadata: inodes, `(parent, name)` dirents, units and their states, content objects |
-| `internal/cas` | Perkeep localdisk store with a quota on unique blob bytes (ported from the perkeep-dualfs prototype) |
-| `internal/tree` | The namespace with bytes from the CAS: the 9P2000.L server (`dotl.go`) and the adapter for the plain 9P2000 server |
+| `internal/meta` | SQLite metadata: inodes, `(parent, name)` dirents, units and their states, content digests and refcounts |
+| `internal/store` | The file store: one plain file per inode under `DATA/files/<unit>/<inode>`, identical files hard-linked, optional per-file zstd |
+| `internal/tree` | The namespace with bytes from the file store: the 9P2000.L server (`dotl.go`) and the adapter for the plain 9P2000 server |
 | `internal/ninep` | A small read-only 9P2000 server |
 | `internal/ingest` | Imports a local directory as a unit (stand-in for subsystem fetchers) |
 | `internal/subsys` | The `Subsystem` interface each subsystem implements, `Viewer` for virtual views, and the conventions below |
 | `internal/subsys/apk` | Alpine packages: read-through HTTP mirror for in-guest apk, per-package overlay layers |
-| `internal/usage` | Usage stats per package, content object and path, kept across eviction; never-opened report |
+| `internal/usage` | Usage stats per package, content digest and path, kept across eviction; never-opened report |
 | `internal/subsys/oci` | OCI images: registry client with anonymous token auth, layer units, merged rootfs views |
-| `internal/fill` | The fill path: unit manager, single-flight faults, spool, async ingest, crash recovery, quota, debug shadow tree |
-| `internal/savings` | Debug savings mode: disk vs CAS savings per subsystem (`/.cache/stats`, `wanix-cache stats`) |
+| `internal/fill` | The fill path: unit manager, single-flight faults, spool, async ingest, crash recovery, quota |
+| `internal/savings` | What the store holds and what dedupe saves, per subsystem (`/.cache/stats`, `wanix-cache stats`) |
 | `internal/h9index` | Generates, stores and serves each root's `/.h9index` (hyper9's mount-index) from metadata |
-| `internal/gc` | Eviction and blob GC: global refcounts, LRU with watermarks, pins, sweep, audit |
-| `bench` | Phase 2 read benchmark: CAS against plain disk, direct and over both 9P servers (`bench/cmd/readbench`); findings in [`bench/RESULTS.md`](bench/RESULTS.md) |
+| `internal/gc` | Eviction: global refcounts, LRU with watermarks, pins, audit |
+| `bench` | Read and savings benchmarks (`bench/savings`); the phase 2 findings that compared the old CAS with plain disk are kept in [`bench/RESULTS.md`](bench/RESULTS.md) |
 | `cmd/wanix-cache` | `serve`, `import`, `index`, `stats`, `units`, `usage`, `gc`, `evict`, `refault`, `audit`, `pin` |
 
 ## Try it
 
-Needs Go 1.27.2 or newer (the pinned Perkeep commit requires it).
+Needs Go 1.27.4 or newer (see `go.mod`).
 
 ```sh
 go run ./cmd/wanix-cache import -data ./cache -key alpine ./some-rootfs
@@ -52,10 +52,18 @@ Attach to one as a root by giving its path as the attach name
   Nix store path) moving through `absent → fetching → spooled → resident →
   evicted`. A unit's manifest (its tree) stays in the DB after its content is
   evicted, so a later read can fault it back in.
-- **Global dedup.** Content objects are keyed by whole-file SHA-256 with no
-  subsystem column, so a file is chunked once no matter which subsystem
-  fetched it. File schemas are written without a name or mtime, so identical
-  bytes always get the identical ref.
+- **Plain files.** Each file inode of a resident unit is an ordinary file at
+  `DATA/files/<unit id>/<inode>`, so a read is an open and a pread with no
+  index in between.
+- **Global dedupe through hard links.** Every file is hashed (whole-file
+  SHA-256) at ingest, with no subsystem column. If a file with that digest
+  is already stored, from any unit in any subsystem, the new inode is a hard
+  link to it (`meta.DB.LinkSource` finds one through the `inode_content`
+  index); otherwise the spool file itself is linked into the store, so
+  ingest copies nothing. The kernel's link count is the refcount for the
+  bytes. If the source is evicted mid-link or a file hits the filesystem's
+  link limit, ingest stores its own copy, and `audit -fix` relinks such
+  copies later. Only whole files dedupe; there is no chunking.
 - **Symlinks** are stored for every subsystem. 9P2000.L serves them; plain
   9P2000 has no way to, so that server hides them.
 - **Read-only.** All client writes fail with EROFS. Only the cache writes.
@@ -70,36 +78,37 @@ Attach to one as a root by giving its path as the attach name
 
 ## Eviction and GC
 
-- **Two refcounts, both global.** `content.refs` counts file inodes of
-  resident units per content object; `gc_blob.refs` counts content objects
-  per CAS blob. Neither has a subsystem column, so a blob shared by an apk
-  and an OCI layer is freed only after the last reference anywhere goes.
+- **One refcount, global.** `content.refs` counts file inodes of resident
+  units per digest, with no subsystem column. On disk the hard-link count
+  does the same job, so a file shared by an apk and an OCI layer keeps its
+  bytes until the last unit holding it is evicted. There is no blob table
+  and no sweep.
 - **Evict** moves a unit `resident -> evicted`, clears its file inodes'
-  content refs (the manifest stays), and drops refcounts. Blobs left at zero
-  are doomed; a **sweep** deletes them through the blobserver
-  (`RemoveBlobs`; Perkeep has no GC of its own). The next read refaults the
-  unit into the same inodes.
+  content digests (the manifest stays) and drops refcounts in one
+  transaction, then removes the unit's store directory. Files another unit
+  still links lose a name and keep their bytes; the rest are freed at once.
+  The next read refaults the unit into the same inodes.
 - **Policy.** One cap with high and low watermarks (default 95% and 85%).
   Victims are the least recently used resident units that are not pinned,
   except that units which would free nothing (all shared) wait until no
   unit that frees bytes is left. Subsystems can veto an eviction
   (`subsys.Evicter`) or order it (`EvictionOrderer`, e.g. Nix referrers
   first).
-- **Evict before admit.** `fill.LocalQuota` and the CAS quota both call the
-  collector when a write does not fit, so a write fails with ENOSPC only
+- **Evict before admit.** `fill.LocalQuota` (store + spool + reservations)
+  calls the collector when a write does not fit, so a write fails with ENOSPC only
   when nothing evictable remains.
 - **Pins.** In-memory pins from the fill manager (fills, open handles,
   views), `Collector.Acquire`, and durable pins in `gc_pin` (package
   indexes): `wanix-cache pin -key K -reason R`.
-- **Ingest contract.** Put blobs through a `cas.Session`, record
-  `RefContent` in the transaction that makes the unit resident, and close
-  the session after commit. The session holds every blob it wrote or found,
-  so a sweep cannot delete a doomed chunk that new content just deduped
-  against. The GC discovers new content rows itself and counts their blobs
-  (backfill), so ingest never calls into it.
-- **Audit** (`wanix-cache audit [-fix] [-deep]`) recomputes both refcounts,
-  compares them with the blobs on disk, deletes orphans, and evicts units
-  whose blobs are missing so they refetch.
+- **Ingest contract.** Link or write every file into the unit's store
+  directory, `SyncUnit`, then record `RefContent` and `SetContent` in the
+  transaction that makes the unit resident. A unit being filled is pinned,
+  so eviction never removes a directory that ingest is writing into.
+- **Audit** (`wanix-cache audit [-fix] [-deep]`) recomputes refcounts,
+  checks every stored file against the inode that should hold it (size, or
+  the digest with `-deep`), removes orphan files and directories, relinks
+  identical files stored apart, and evicts units with missing or damaged
+  files so they refetch.
 
 ## h9index for roots
 
@@ -129,8 +138,8 @@ reads reach the cache.
   itself. It covers every file in the cache's tree; it doesn't know what h9
   binds over.
 - **qid.vers is 0** for every file in both servers: unit trees never change
-  in place, and a version derived from the CAS ref changed when ingest set
-  it, which h9 would see as a stale file.
+  in place, and a version derived from the content digest would change when
+  ingest set it, which h9 would see as a stale file.
 - **Storage and serving.** The text is kept in `h9index_file` (owner
   `h9index`, its own migrations), keyed by root directory and variant, and
   pinned to that directory's mtime and unit so a reused inode never serves
@@ -206,7 +215,7 @@ upgrades and never feeds the LRU.
 | Level | Key | Counts |
 |---|---|---|
 | Package | subsystem, name, version (from `Info.Name`/`Version`) | opens, fetches, refetches, bytes read |
-| Object | CAS content ref (one per distinct file content) | opens, bytes read, which paths hold it |
+| Object | content digest (one per distinct file content) | opens, bytes read, which paths hold it |
 | Path | subsystem, package (or unit key), path in the unit | opens, bytes read |
 
 - Each level has daily rows (packages kept 90 days, objects and paths 30)
@@ -239,7 +248,8 @@ needed on the cache side.
 - `/nix/store/<hash>-<name>/` is one store path (unit key `<hash>-<name>`).
   Looking it up fetches the narinfo, streams the NAR (xz, zstd, bzip2, gzip
   or none), checks the NarHash over the stream, and unpacks it into the
-  spool and then the CAS, so files dedupe across paths and subsystems.
+  spool and then the file store, so identical files are hard-linked across
+  paths and subsystems.
 - `/nix/closure/<hash>-<name>/` is the path's whole closure as a root, as
   a metadata-only view (`subsys.Viewer`): `nix/store/<member>/` for every
   path reachable through narinfo References, each the member's own unit.
@@ -275,10 +285,10 @@ that path as a 9P root directly.
   Tags are trusted for `-oci-tag-ttl`; if the registry is unreachable the
   cached resolution is used. Digest references never re-resolve.
 - **Layers are units** keyed by diff_id, mounted at `/oci/layers/<diff_id>/`,
-  stored unpacked file by file (gzip, zstd and plain tar layers), so files
-  dedupe across layers, images and subsystems. The compressed blob digest
-  and the diff_id are both verified; `oci_blob` keeps the
-  compressed-digest-to-diff_id mapping.
+  stored unpacked file by file (gzip, zstd and plain tar layers), so
+  identical files are hard-linked across layers, images and subsystems.
+  The compressed blob digest and the diff_id are both verified; `oci_blob`
+  keeps the compressed-digest-to-diff_id mapping.
 - **The merged rootfs is a view.** Its directories are virtual
   (`subsys.Viewer`, inode numbers with bit 61 set); its files are the real
   inodes of the winning layer, so reads go through the fill path and are
@@ -301,76 +311,68 @@ that path as a 9P root directly.
 `WANIX_OCI_LIVE=1 go test -run Live ./internal/subsys/oci` pulls
 alpine:3.20 from Docker Hub through the 9P2000.L server.
 
-## Savings (debug mode)
+## Savings
 
-`wanix-cache stats` and `/.cache/stats` report what the CAS saves, in
-total and per subsystem. Sizes are allocated blocks (st_blocks × 512).
-`stats -json` prints the same report as JSON, one result per run for the
-savings test plan.
+`wanix-cache stats` and `/.cache/stats` report what the store holds and
+what dedupe saves, in total and per subsystem. Sizes are allocated blocks
+(st_blocks × 512) unless they say otherwise. `stats -json` prints the same
+report as JSON, one result per run for the savings test plan.
 
-- **CAS total**: the blob store (blob files and localdisk's hash-prefix
-  directories) plus the metadata DB.
+- **Stored files**: distinct files on disk, their bytes and allocated
+  blocks, and the names (hard links) that point at them. **Store
+  directories** and the **metadata DB** make up the rest of the total.
 - **Whole-file dedupe**: 1 − distinct content bytes ÷ logical bytes.
-  **Chunk dedupe**: 1 − unique chunk bytes ÷ distinct content bytes, which
-  is what chunking adds on top.
-- **Schema blobs**, **per-blob overhead** (blob files' allocated minus
-  logical bytes) and **store directories**, each as a share of CAS total,
-  plus slack by content size class (< 4, 16, 64 KiB), which tells you
-  whether small-file packing would pay.
-- **Exclusive and shared** blob bytes per subsystem, with the bytes shared
-  with each other subsystem. **Attributed** splits each shared blob evenly
-  between the subsystems that reach it.
-- **B2**, plain unpacked with no dedupe, needs the shadow tree:
-  `serve -debug-shadow` keeps every resident unit unpacked under
-  `DATA/shadow/<subsystem>/<unit id>`. Right after ingest the tree is
-  hard-linked from the unit's spool files, so it costs no copy; missing
-  trees are written from the CAS at startup and before each `/.cache/stats`.
-  Eviction removes a unit's tree. The shadow is **not** counted by
-  `-max-gib`, so leave headroom. **B3 (est.)** approximates the shadow with
-  identical files hard-linked. Running `rdfind`/`jdupes` over a copy of the
-  shadow gives the measured B3.
-- The 20 units with the most exclusive bytes and the 20 most-shared content
-  objects, which explain most surprises.
+  **Without dedupe (est.)** is what the same units would take with every
+  file stored separately; the difference is what hard links save.
+- **Unlinked copies**: identical files stored twice (after a link fell back
+  to a copy). `audit -fix` links them.
+- **Exclusive and shared** bytes per subsystem, with the bytes shared with
+  each other subsystem. **Attributed** splits each shared file evenly
+  between the subsystems that hold it.
+- Slack by content size class, the 20 units with the most exclusive bytes,
+  and the 20 most-shared contents, which explain most surprises.
 
 W0 (the Go source tree as one local unit, ext4):
 
 | | |
 |---|---|
 | Logical | 126.3 MiB (12,054 files) |
-| B2, plain unpacked | 162.3 MiB |
-| CAS total | 289 to 297 MiB (store 281.2 MiB + DB 8 to 16 MiB with WAL) |
-| Whole-file / chunk dedupe | 1.2% / 0.1% |
-| Per-blob overhead | 74.8 MiB, 26% of CAS total (24,040 blob files) |
-| Store directories | 79.7 MiB, 27% of CAS total (20,410 directories) |
-| Slack from contents under 4 KiB | 68% of all slack |
+| Stored files | 11,806, 124.7 MiB, 154.5 MiB allocated |
+| Total with DB | 162.4 MiB (store 154.7 MiB + DB 7.7 MiB) |
+| Whole-file dedupe | 1.2% |
+| Slack from contents under 4 KiB | 72% of all slack |
 
-So on small-file trees, localdisk's layout costs more than half the CAS:
-one 4 KiB block per blob file (two per file) plus one per hash-prefix
-directory. That is the "per-blob overhead above 10%" row of the test plan's
-decision table, before the larger workloads have run.
-
-**Small-blob packing (experimental).** `serve -pack-small N` stores blobs
-of at most N bytes in Perkeep diskpacked pack files under `blobs/packed`
-(LevelDB index, holes punched on delete) instead of one localdisk file
-each; it is recorded in `blobs/packed/THRESHOLD` and stays on. The pack
-index is locked by one process, so stop the server before `stats`, `gc` or
-`audit`. On W7 of the savings plan (3.9 GiB logical): CAS 3.57 GiB
-without it, 3.13 GiB at 64 KiB (4.9% below hard-linked plain disk), 2.98
-GiB packing every blob (9.5% below), but diskpacked syncs every blob, so
-packing everything doubled the time to ingest W7 (504 s against 261 s).
-
-**Per-blob zstd (optional, off by default).** Read speed comes before
+**Per-file zstd (optional, off by default).** Read speed comes before
 storage, so compression is opt-in. `serve -zstd L` (1 fastest to 4 best),
-only on a new, empty cache, stores every blob as a header byte and either
-its bytes or a zstd frame of them, whichever is smaller. Refs stay hashes
-of the uncompressed bytes, so dedupe is unchanged. With `-pack-small 65536`
-it took W7 to 1.45 GiB (56% below hard-linked plain disk) and 293 s to
-ingest. The cost is reads: over 9P2000.L, with the namespace cache, a W7
-re-read went from 12,487 to 8,016 files a second, and large files from
-about 1.7 to 1.0 GiB/s. Blob sizes in `stats` are then stored
-(compressed) bytes, so its chunk-dedupe ratio also counts compression.
+only on a new, empty cache, stores every file as a header byte and either
+its bytes or a zstd frame of them, whichever is smaller. It is recorded in
+`DATA/files/ZSTD` and stays on. Digests are of the uncompressed bytes, so
+dedupe is unchanged. It roughly halves the store on mixed trees (W7 of the
+savings plan: 3,372 MiB to 1,519 MiB) and costs reads: on W0 over
+9P2000.L, a first pass went from about 16k to 13k files a second and a warm
+re-read from about 21k to 16.5k.
 
-## Measurements (phase 1)
+### Why plain files
+
+The cache first stored content in a Perkeep content-addressed store with
+rolling-hash chunking. The savings test plan measured it against plain
+files with identical files hard-linked:
+
+| W7 (mixed, 3.9 GiB logical) | Store | With zstd |
+|---|---:|---:|
+| Plain files + hard links | 3,372 MiB | 1,519 MiB |
+| CAS | 3,013 MiB | 1,293 MiB |
+
+Chunk dedupe saved about 11% on top of whole-file dedupe, and it cost
+reads: whole-tree reads over 9P were 15.6k files a second from plain files
+against 12.5k from the CAS. On small-file trees the CAS was larger, not
+smaller (W0: 281 MiB of blobs against 155 MiB of plain files), because
+each blob was its own file plus hash-prefix directories. Since read speed
+matters more than storage here, the CAS was removed. Old caches are
+converted on open: their resident units become evicted and refetch on the
+next read, and the `blobs/` directory can be deleted by hand.
+
+## Measurements
 
 Every performance change, with before and after numbers, is logged in
 [`docs/perf-log.md`](docs/perf-log.md).
@@ -378,11 +380,11 @@ Every performance change, with before and after numbers, is logged in
 - Lookup by `(parent, name)`: 7 µs at 1k entries, 12 µs at 100k entries
   (`go test -v -run LookupScales ./internal/meta`). The prototype's
   `index.json` was 37x slower at 11.6k entries.
-- Importing the Go source tree (12k files, 126 MiB): 26 s the first time,
-  1 s the second (whole-file digests hit, nothing re-chunked).
-- On disk the CAS took 282 MiB for that tree against 163 MiB for the plain
-  tree: one localdisk file per blob, at least two blobs per file. Small-file
-  packing is a known follow-up.
+- Importing the Go source tree (12k files, 126 MiB) takes about 23 s on a
+  4-CPU VM; the store holds it in 155 MiB, against 162 MiB for a plain copy.
+- Reading it back over 9P2000.L (`bench/savings/ninebench`, 8 readers):
+  about 16k files a second on a first pass, 21k warm, and 10 to 12k with a
+  cold page cache.
 
 ## Tests
 

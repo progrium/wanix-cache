@@ -10,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/progrium/wanix-cache/internal/cas"
+	"github.com/progrium/wanix-cache/internal/store"
 )
 
 // DiskSpool is the plain-disk Spool: dir/<unit>/<ino>.
@@ -139,7 +139,7 @@ func (f *sfile) Fail(err error) {
 
 // Open implements Spool. The returned file holds its own descriptor, so it
 // keeps working after Remove.
-func (s *DiskSpool) Open(ino uint64) (cas.File, error) {
+func (s *DiskSpool) Open(ino uint64) (store.File, error) {
 	s.mu.Lock()
 	f := s.files[ino]
 	s.mu.Unlock()
@@ -230,7 +230,7 @@ func (s *DiskSpool) count(unit, n int64) {
 
 // Release stops counting a unit's spool files in Bytes while they stay on
 // disk and readable, and returns how many bytes it stopped counting. Ingest
-// calls it once the unit's bytes are in the CAS, just before the commit that
+// calls it once the unit's bytes are in the store, just before the commit that
 // makes the unit resident, so the quota never counts them twice; it passes
 // the result to Unrelease if that commit fails. Remove then deletes the
 // files without counting them again.

@@ -55,7 +55,7 @@ type Inode struct {
 	Mode    fs.FileMode // permission bits only
 	Size    int64
 	Mtime   time.Time
-	Content string // CAS ref of a file's bytes; empty for an empty file
+	Content string // whole-file digest of bytes in the store; "" while not stored, and for empty files
 	Target  string // symlink target
 	Parent  uint64 // directories only
 	Unit    int64  // owning unit; 0 for namespace scaffolding

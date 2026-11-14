@@ -8,29 +8,23 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/gc"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 )
 
 // startGC attaches the eviction policy to a serving manager and runs the
 // watermark loop in the background.
-func startGC(db *meta.DB, store *cas.Store, mgr fill.Manager, quota *fill.LocalQuota, max int64, shadow string) error {
-	c, err := gc.New(context.Background(), db, store, gc.Config{
+func startGC(db *meta.DB, st *store.Store, mgr fill.Manager, quota *fill.LocalQuota, max int64) error {
+	c, err := gc.New(context.Background(), db, st, gc.Config{
 		Max: max,
 		Usage: func() int64 {
 			u := quota.Usage()
-			return u.CAS + u.Spool + u.Reserved
+			return u.Store + u.Spool + u.Reserved
 		},
 		Logf: log.Printf,
-		// The debug shadow tree mirrors resident units only.
-		Notify: func(ev fill.UnitEvent) {
-			if err := fill.RemoveShadow(shadow, ev.Unit); err != nil {
-				log.Printf("shadow: %v", err)
-			}
-		},
 	})
 	if err != nil {
 		return err
@@ -53,12 +47,12 @@ func gcCommand(cmd string, fl *flag.FlagSet, data *string, args []string) error 
 	)
 	switch cmd {
 	case "gc":
-		gib = fl.Int64("max-gib", 0, "cap for the watermarks, GiB; 0 = sweep only")
+		gib = fl.Int64("max-gib", 0, "cap for the watermarks, GiB; 0 = do nothing")
 		high = fl.Float64("high", 0.95, "evict when usage is over this fraction of the cap")
 		low = fl.Float64("low", 0.85, "evict down to this fraction of the cap")
 	case "audit":
 		fix = fl.Bool("fix", false, "repair what the audit finds")
-		deep = fl.Bool("deep", false, "re-walk every content schema in the CAS")
+		deep = fl.Bool("deep", false, "re-hash every stored file and compare it with its digest")
 	case "pin":
 		reason = fl.String("reason", "manual", "pin reason; each reason is a separate pin")
 		unpin = fl.Bool("unpin", false, "remove the pin instead")
@@ -69,7 +63,7 @@ func gcCommand(cmd string, fl *flag.FlagSet, data *string, args []string) error 
 	if gib != nil {
 		max = *gib << 30
 	}
-	db, store, err := open(*data, 0)
+	db, st, err := open(*data)
 	if err != nil {
 		return err
 	}
@@ -78,7 +72,7 @@ func gcCommand(cmd string, fl *flag.FlagSet, data *string, args []string) error 
 	if high != nil {
 		cfg.High, cfg.Low = *high, *low
 	}
-	c, err := gc.New(ctx, db, store, cfg)
+	c, err := gc.New(ctx, db, st, cfg)
 	if err != nil {
 		return err
 	}
@@ -91,13 +85,12 @@ func gcCommand(cmd string, fl *flag.FlagSet, data *string, args []string) error 
 
 	switch cmd {
 	case "gc":
-		before, _ := store.Usage()
+		before := st.Used()
 		freed, err := c.Collect(ctx)
 		if err != nil {
 			return err
 		}
-		after, _ := store.Usage()
-		fmt.Printf("freed %s; CAS %s -> %s\n", size(freed), size(before), size(after))
+		fmt.Printf("freed %s; stored %s -> %s\n", size(freed), size(before), size(st.Used()))
 	case "evict":
 		u, err := unit()
 		if err != nil {
@@ -112,11 +105,11 @@ func gcCommand(cmd string, fl *flag.FlagSet, data *string, args []string) error 
 		if fl.NArg() != 1 {
 			return fmt.Errorf("refault: need the source directory")
 		}
-		res, err := ingest.RefaultDir(ctx, db, store, *sub, *key, fl.Arg(0))
+		res, err := ingest.RefaultDir(ctx, db, st, *sub, *key, fl.Arg(0))
 		if err != nil {
 			return err
 		}
-		fmt.Printf("refaulted %s/%s: %d files, %s, %d new content objects\n",
+		fmt.Printf("refaulted %s/%s: %d files, %s, %d new contents\n",
 			res.Unit.Subsystem, res.Unit.Key, res.Files, size(res.LogicalBytes), res.NewContents)
 	case "audit":
 		rep, err := c.Audit(ctx, gc.AuditOptions{Fix: *fix, Deep: *deep})

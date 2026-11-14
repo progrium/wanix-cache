@@ -14,10 +14,10 @@ import (
 
 	"github.com/hugelgupf/p9/p9"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
 
@@ -36,10 +36,10 @@ func TestUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, _ := cas.Open(dir, 0)
+	st, _ := store.Open(dir)
 	sp, _ := fill.OpenDiskSpool(filepath.Join(dir, "spool"))
-	q := &fill.LocalQuota{CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: sp.Bytes}
-	m, err := fill.NewManager(db, store, sp, q, fill.Options{Logf: t.Logf})
+	q := &fill.LocalQuota{Store: st.Used, Spool: sp.Bytes}
+	m, err := fill.NewManager(db, st, sp, q, fill.Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tfs := &tree.FS{Meta: db, CAS: store, Files: m, Faults: m, Index: idx}
+	tfs := &tree.FS{Meta: db, Store: st, Files: m, Faults: m, Index: idx}
 	n, _ := New(db, Options{Indexer: tfs.Indexer(idx, ""), Logf: t.Logf})
 	if err := m.Register(ctx, n); err != nil {
 		t.Fatal(err)

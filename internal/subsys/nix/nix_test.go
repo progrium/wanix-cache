@@ -21,10 +21,10 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 
-	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/store"
 	"github.com/progrium/wanix-cache/internal/subsys"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
@@ -265,12 +265,12 @@ const (
 )
 
 type env struct {
-	ctx   context.Context
-	db    *meta.DB
-	store *cas.Store
-	m     *fill.LocalManager
-	nix   *Subsystem
-	fx    *fixtures
+	ctx context.Context
+	db  *meta.DB
+	st  *store.Store
+	m   *fill.LocalManager
+	nix *Subsystem
+	fx  *fixtures
 }
 
 func newEnv(t *testing.T, opts Options) *env {
@@ -280,10 +280,10 @@ func newEnv(t *testing.T, opts Options) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, _ := cas.Open(dir, 0)
+	st, _ := store.Open(dir)
 	sp, _ := fill.OpenDiskSpool(filepath.Join(dir, "spool"))
-	q := &fill.LocalQuota{CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: sp.Bytes}
-	m, err := fill.NewManager(db, store, sp, q, fill.Options{Logf: t.Logf})
+	q := &fill.LocalQuota{Store: st.Used, Spool: sp.Bytes}
+	m, err := fill.NewManager(db, st, sp, q, fill.Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +312,7 @@ func newEnv(t *testing.T, opts Options) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.Close(); m.Close(); db.Close() })
-	return &env{ctx: ctx, db: db, store: store, m: m, nix: n, fx: fx}
+	return &env{ctx: ctx, db: db, st: st, m: m, nix: n, fx: fx}
 }
 
 func (e *env) read(t *testing.T, key subsys.Key, rel string) string {
@@ -453,7 +453,7 @@ func TestClosure(t *testing.T) {
 	if strings.Join(keysOf(got), " ") != strings.Join(keysOf(want), " ") {
 		t.Fatalf("closure = %v, want %v", got, want)
 	}
-	tfs := &tree.FS{Meta: e.db, CAS: e.store, Files: e.m, Faults: e.m}
+	tfs := &tree.FS{Meta: e.db, Store: e.st, Files: e.m, Faults: e.m}
 	if err := tfs.AddViewer(ctx, Name, e.nix); err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +549,7 @@ func TestClosure(t *testing.T) {
 func TestViewIdleUnpins(t *testing.T) {
 	e := newEnv(t, Options{ViewIdle: 500 * time.Millisecond})
 	ctx := e.ctx
-	tfs := &tree.FS{Meta: e.db, CAS: e.store, Files: e.m, Faults: e.m}
+	tfs := &tree.FS{Meta: e.db, Store: e.st, Files: e.m, Faults: e.m}
 	tfs.AddViewer(ctx, Name, e.nix)
 	n, _ := tfs.Root(ctx)
 	var err error

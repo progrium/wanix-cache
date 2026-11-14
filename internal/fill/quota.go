@@ -4,14 +4,14 @@ import (
 	"context"
 	"sync"
 
-	"github.com/progrium/wanix-cache/internal/cas"
+	"github.com/progrium/wanix-cache/internal/store"
 )
 
-// LocalQuota implements Quota over the CAS usage counter, the spool's byte
-// count and its own reservations. Max 0 means unlimited.
+// LocalQuota implements Quota over the file store's byte count, the
+// spool's byte count and its own reservations. Max 0 means unlimited.
 type LocalQuota struct {
 	Max   int64
-	CAS   func() int64
+	Store func() int64
 	Spool func() int64
 
 	mu        sync.Mutex
@@ -31,7 +31,7 @@ func (q *LocalQuota) setReclaimer(r Reclaimer) {
 func (q *LocalQuota) Usage() Usage {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return Usage{CAS: q.CAS(), Spool: q.Spool(), Reserved: q.reserved, Max: q.Max}
+	return Usage{Store: q.Store(), Spool: q.Spool(), Reserved: q.reserved, Max: q.Max}
 }
 
 // take reserves n bytes, reclaiming once if needed.
@@ -41,17 +41,17 @@ func (q *LocalQuota) take(ctx context.Context, n int64) error {
 	}
 	for attempt := 0; ; attempt++ {
 		q.mu.Lock()
-		over := q.Max > 0 && q.CAS()+q.Spool()+q.reserved+n > q.Max
+		over := q.Max > 0 && q.Store()+q.Spool()+q.reserved+n > q.Max
 		if !over {
 			q.reserved += n
 			q.mu.Unlock()
 			return nil
 		}
-		need := q.CAS() + q.Spool() + q.reserved + n - q.Max
+		need := q.Store() + q.Spool() + q.reserved + n - q.Max
 		r := q.reclaimer
 		q.mu.Unlock()
 		if r == nil || attempt > 0 {
-			return cas.ErrFull
+			return store.ErrFull
 		}
 		if _, err := r.Reclaim(ctx, need); err != nil {
 			return err

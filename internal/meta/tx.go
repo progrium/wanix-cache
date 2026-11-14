@@ -118,7 +118,8 @@ func (t *Tx) Mkdir(parent uint64, name string, mode fs.FileMode, mtime time.Time
 	return t.create(parent, name, Inode{Kind: KindDir, Mode: mode, Mtime: mtime, Unit: unit})
 }
 
-// File creates a regular file whose bytes are the CAS object content.
+// File creates a regular file. content is its whole-file digest once its
+// bytes are in the store, or "" (empty file, or bytes still in the spool).
 func (t *Tx) File(parent uint64, name string, mode fs.FileMode, size int64, mtime time.Time, content string, unit int64) (uint64, error) {
 	return t.create(parent, name, Inode{Kind: KindFile, Mode: mode, Size: size, Mtime: mtime, Content: content, Unit: unit})
 }
@@ -179,32 +180,22 @@ func (t *Tx) MkdirAll(p string) (uint64, error) {
 	return ino, nil
 }
 
-// ContentRef returns the CAS ref already stored for a whole-file digest.
-func (t *Tx) ContentRef(digest string) (string, bool, error) {
-	var ref string
-	err := t.tx.QueryRowContext(t.ctx, `SELECT ref FROM content WHERE digest = ?`, digest).Scan(&ref)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	return ref, err == nil, err
-}
-
-// RefContent records one more reference to a content object, creating it
-// if it is new.
-func (t *Tx) RefContent(digest, ref string, size int64) error {
+// RefContent records one more reference to the content object with this
+// whole-file digest, creating it if it is new.
+func (t *Tx) RefContent(digest string, size int64) error {
 	_, err := t.tx.ExecContext(t.ctx, `INSERT INTO content (digest, ref, size, refs) VALUES (?, ?, ?, 1)
-		ON CONFLICT (digest) DO UPDATE SET refs = refs + 1`, digest, ref, size)
+		ON CONFLICT (digest) DO UPDATE SET refs = refs + 1`, digest, digest, size)
 	return err
 }
 
-// ContentRef is the read-only form of Tx.ContentRef.
-func (d *DB) ContentRef(ctx context.Context, digest string) (string, bool, error) {
-	var ref string
-	err := d.db.QueryRowContext(ctx, `SELECT ref FROM content WHERE digest = ?`, digest).Scan(&ref)
+// LinkSource returns a file inode whose bytes are stored with this
+// whole-file digest, for ingest to hard-link a new identical file to.
+func (d *DB) LinkSource(ctx context.Context, digest string) (unit int64, ino uint64, ok bool, err error) {
+	err = d.db.QueryRowContext(ctx, `SELECT unit, ino FROM inode WHERE content = ? LIMIT 1`, digest).Scan(&unit, &ino)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
+		return 0, 0, false, nil
 	}
-	return ref, err == nil, err
+	return unit, ino, err == nil, err
 }
 
 // Whiteout records that name in parent hides lower layers' entries.
