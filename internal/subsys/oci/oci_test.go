@@ -319,7 +319,12 @@ func TestDownloadsCappedPerRegistry(t *testing.T) {
 	}
 	reg.push("test/many", "v1", amd64, ls...)
 	e := newEnv(t, Options{Client: &Client{PerRegistry: 2}})
-	got := e.ls(t, "/oci/"+reg.host()+"/test/many@v1")
+	var got []string
+	for _, n := range e.ls(t, "/oci/"+reg.host()+"/test/many@v1") {
+		if n != h9index.Name { // present once the rootfs has been indexed
+			got = append(got, n)
+		}
+	}
 	if len(got) != 6 {
 		t.Fatalf("ls = %v", got)
 	}
