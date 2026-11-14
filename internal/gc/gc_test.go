@@ -494,9 +494,23 @@ func TestConcurrentImportAndReclaim(t *testing.T) {
 	}()
 	wg.Wait()
 	close(errs)
+	failed := 0
 	for err := range errs {
+		failed++
 		if !errors.Is(err, cas.ErrFull) {
 			t.Error(err)
+		}
+	}
+	if failed > 0 {
+		// An import that hit ErrFull leaves the blobs it wrote before the
+		// failure; they are orphans, which is what the audit is for.
+		rep, err := e.c.Audit(e.ctx, AuditOptions{Fix: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%d imports failed with ErrFull; repair:\n%s", failed, rep)
+		if rep.ContentRefsFixed+rep.BlobRefsFixed+len(rep.MissingBlobs)+len(rep.BrokenUnits) > 0 {
+			t.Fatalf("refcounts drifted under concurrency:\n%s", rep)
 		}
 	}
 	us, _ := e.db.Units(e.ctx, "local")

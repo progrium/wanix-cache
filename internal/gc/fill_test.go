@@ -93,8 +93,10 @@ func TestFillManagerPastCap(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(10 * time.Second)
 		for {
+			// The manager commits resident before it removes the spool, so
+			// wait for both or the spool bytes are briefly counted twice.
 			u, err := db.Unit(ctx, "mem", string(k))
-			if err == nil && u.State == meta.UnitResident {
+			if err == nil && u.State == meta.UnitResident && spool.Bytes() == 0 {
 				return
 			}
 			if time.Now().After(deadline) {
