@@ -146,7 +146,13 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 	if err != nil {
 		return err
 	}
-	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr, Index: idx}
+	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr, Index: idx,
+		Synthetic: map[string]tree.SyntheticFunc{
+			"usage": func(ctx context.Context) ([]byte, error) { return usageReport(ctx, db) },
+		}}
+	if err := fs.InitSynthetic(context.Background()); err != nil {
+		return err
+	}
 	rootIndexer = fs.Indexer(idx, "")
 	if err := registerSubsystems(context.Background(), mgr, dir); err != nil {
 		return err

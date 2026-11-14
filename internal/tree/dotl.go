@@ -133,6 +133,8 @@ func (n *lnode) Walk(names []string) ([]p9.QID, p9.File, error) {
 		}
 		if name == ".." {
 			next, err = n.fs.get(ctx, cur.Parent)
+		} else if sin, ok, serr := n.fs.synthLookup(ctx, cur.Ino, name); serr != nil || ok {
+			next, err = sin, serr
 		} else {
 			next, err = n.fs.lookup(ctx, cur.Ino, name)
 		}
@@ -175,7 +177,7 @@ func lattr(in meta.Inode) p9.Attr {
 func (n *lnode) GetAttr(req p9.AttrMask) (p9.QID, p9.AttrMask, p9.Attr, error) {
 	in := n.in
 	a := lattr(in)
-	if in.Kind != meta.KindDir && n.idx == nil && req.NLink {
+	if in.Kind != meta.KindDir && n.idx == nil && !isSynth(in.Ino) && req.NLink {
 		nl, err := n.fs.Meta.Nlink(context.Background(), in.Ino)
 		if err != nil {
 			return p9.QID{}, p9.AttrMask{}, p9.Attr{}, linux.EIO
@@ -209,6 +211,14 @@ func (n *lnode) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 	switch {
 	case n.idx != nil:
 		f, err := n.fs.openIndex(context.Background(), n.idx.Ino)
+		if err != nil {
+			return p9.QID{}, 0, errno(err)
+		}
+		n.mu.Lock()
+		n.file = f
+		n.mu.Unlock()
+	case isSynth(n.in.Ino):
+		f, err := n.fs.synthOpen(context.Background(), n.in.Ino)
 		if err != nil {
 			return p9.QID{}, 0, errno(err)
 		}
@@ -259,6 +269,9 @@ func (n *lnode) Readdir(offset uint64, count uint32) (p9.Dirents, error) {
 		return nil, linux.ENOTDIR
 	}
 	ctx := context.Background()
+	if n.fs.isSynthDir(n.in.Ino) {
+		return n.synthReaddir(ctx, offset, count)
+	}
 	// An indexed directory lists its /.h9index first, at offset 0, so the
 	// real entries' offsets are their positions plus one. 9P2000.L
 	// readdir has no order to keep.

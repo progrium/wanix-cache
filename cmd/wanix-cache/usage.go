@@ -25,6 +25,9 @@ func startUsage(ctx context.Context, db *meta.DB, m *fill.LocalManager) error {
 		return err
 	}
 	t.Attach(m)
+	if err := t.Backfill(ctx); err != nil {
+		log.Printf("usage: backfill: %v", err)
+	}
 	usageTracker = t
 	go t.Run(ctx, 30*time.Second)
 	return nil

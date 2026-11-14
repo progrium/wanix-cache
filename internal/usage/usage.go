@@ -191,6 +191,42 @@ func New(ctx context.Context, db *meta.DB, subs Subsystems) (*Tracker, error) {
 	return t, nil
 }
 
+// Backfill records package names for units that have none in usage_unit
+// yet (units cached before usage tracking ran), so offline reports can
+// name their packages. Run it after the subsystems are registered.
+func (t *Tracker) Backfill(ctx context.Context) error {
+	rows, err := t.sql.QueryContext(ctx, `SELECT id FROM unit WHERE id NOT IN (SELECT unit FROM usage_unit)`)
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	t.flushMu.Lock()
+	defer t.flushMu.Unlock()
+	for _, id := range ids {
+		ui, err := t.unitInfo(ctx, id)
+		if err != nil {
+			continue
+		}
+		if _, err := t.sql.ExecContext(ctx, `INSERT OR IGNORE INTO usage_unit (unit, subsystem, key, name, version) VALUES (?, ?, ?, ?, ?)`,
+			id, ui.sub, ui.key, ui.name, ui.version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Attach subscribes the tracker to a manager's open and unit events.
 func (t *Tracker) Attach(m fill.Manager) {
 	m.WatchOpens(t.Open)
@@ -225,6 +261,15 @@ func (t *Tracker) Open(ev fill.OpenEvent) {
 // Unit records fetches and refetches from unit state changes.
 func (t *Tracker) Unit(ev fill.UnitEvent) {
 	if ev.To != meta.UnitFetching {
+		if ev.To == meta.UnitSpooled {
+			// Make sure the unit gets a usage_unit row at the next flush,
+			// even if nothing opens it.
+			t.mu.Lock()
+			if t.units[ev.Unit.ID] == nil {
+				t.units[ev.Unit.ID] = &unitCounter{}
+			}
+			t.mu.Unlock()
+		}
 		return
 	}
 	t.mu.Lock()
@@ -383,7 +428,7 @@ func (t *Tracker) Flush(ctx context.Context) error {
 			continue
 		}
 		seenUnits[id] = ui
-		if ui.derived {
+		if ui.derived || c.fetches+c.refetches == 0 {
 			continue
 		}
 		if a := pkgOf(ui); a != nil {

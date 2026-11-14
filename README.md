@@ -20,11 +20,13 @@ the debug savings mode, and the subsystems come in later phases.
 | `internal/ninep` | A small read-only 9P2000 server |
 | `internal/ingest` | Imports a local directory as a unit (stand-in for subsystem fetchers) |
 | `internal/subsys` | The `Subsystem` interface each subsystem implements, `Viewer` for virtual views, and the conventions below |
+| `internal/subsys/apk` | Alpine packages: read-through HTTP mirror for in-guest apk, per-package overlay layers |
+| `internal/usage` | Usage stats per package, content object and path, kept across eviction; never-opened report |
 | `internal/subsys/oci` | OCI images: registry client with anonymous token auth, layer units, merged rootfs views |
 | `internal/fill` | The fill-path API: unit manager, spool, quota, reclaimer hook (implementation in progress) |
 | `internal/h9index` | Generates, stores and serves each root's `/.h9index` (hyper9's mount-index) from metadata |
 | `internal/gc` | Eviction and blob GC: global refcounts, LRU with watermarks, pins, sweep, audit |
-| `cmd/wanix-cache` | `serve`, `import`, `index`, `stats`, `units`, `gc`, `evict`, `refault`, `audit`, `pin` |
+| `cmd/wanix-cache` | `serve`, `import`, `index`, `stats`, `units`, `usage`, `gc`, `evict`, `refault`, `audit`, `pin` |
 
 ## Try it
 
@@ -151,6 +153,69 @@ reads reach the cache.
   `internal/meta/migrate.go` under owner `core`.
 - Unit keys must be stable and content-identifying (apk checksum, layer
   diff_id, store path hash), because refetching must produce the same tree.
+
+## APK
+
+`internal/subsys/apk` makes `apk add` inside a guest immediate for any
+package used before on this machine, without sharing a writable apk cache
+directory into the guest.
+
+- `-apk-mirror ADDR` serves a mirror of `-apk-upstream` (the Alpine CDN by
+  default). Point the guest at it: `http://ADDR/v3.20/main` in
+  `/etc/apk/repositories`. It serves `/<branch>/<repo>/<arch>/APKINDEX.tar.gz`
+  and `<name>-<ver>.apk`, read-only.
+- **APKINDEX** is kept whole in `apk_index` (in the metadata database, so it
+  is never evicted) and revalidated upstream by ETag after
+  `-apk-index-ttl` (1 minute). If upstream is down the cached copy is
+  served. Its records go to `apk_pkg`, which is never pruned, so a
+  superseded package's units can still be described and refetched.
+- **Each package is two units**, keyed by the SHA-1 in its APKINDEX `C:`
+  checksum: the raw `.apk` (key `<sha1>.apk`, mounted at
+  `/apk/<arch>/.apk/<name>-<ver>/`), which the mirror serves as an immutable
+  file because it can't be rebuilt byte for byte; and its unpacked data
+  files (key `<sha1>`) at `/apk/<arch>/<name>-<ver>/`, usable as an overlay
+  layer, with no install scripts run and an `/.h9index`. The layer is built
+  from the cached `.apk`, so upstream is hit once; `-apk-unpack` (on) builds
+  it in the background after the mirror serves the `.apk`.
+- **Verified while streaming:** the control stream's SHA-1 must match the
+  index checksum and the data stream's SHA-256 must match `.PKGINFO`'s
+  `datahash`, or the fill fails and leaves nothing behind.
+- **Exit check, against the real CDN:** `apk.static --root R --initdb add
+  busybox musl-utils zlib` through the mirror took 1.5 s the first time and
+  0.07 s the second, with no upstream requests.
+
+## Usage stats
+
+`internal/usage` runs inside `serve` for every subsystem. History is kept
+in `usage_*` tables, separate from `unit`, so it survives eviction and
+upgrades and never feeds the LRU.
+
+| Level | Key | Counts |
+|---|---|---|
+| Package | subsystem, name, version (from `Info.Name`/`Version`) | opens, fetches, refetches, bytes read |
+| Object | CAS content ref (one per distinct file content) | opens, bytes read, which paths hold it |
+| Path | subsystem, package (or unit key), path in the unit | opens, bytes read |
+
+- Each level has daily rows (packages kept 90 days, objects and paths 30)
+  and running totals kept forever: first seen, last used, days used.
+- A **refetch** is a fault on a unit that was evicted before, which
+  measures eviction regret. Units a subsystem marks `usage.Derived` (an
+  apk's unpacked layer, a Nix closure) are not counted as fetches, and
+  opens made with `fill.Internal(ctx)` (the cache reading its own units)
+  are not counted at all.
+- **Hot path:** an open is one increment in a sharded in-memory map keyed
+  by inode, and bytes read are added at close. A flush every 30 s maps
+  inodes to units, contents and paths in one transaction.
+- **Never opened:** `wanix-cache usage -untouched` lists the files in
+  spooled or resident units with no recorded open, per unit with sizes and
+  the never-read share. Hard links count as opened through any name.
+- `wanix-cache usage [-subsystem S] [-days N] [-n N] [-untouched] [-json]`
+  reads the database directly; `/.cache/usage` on the 9P root is the same
+  report (with never-opened files), generated at lookup.
+- Caveats: a guest's page cache can serve repeat opens without asking the
+  server, so days used is the robust signal. Files apk installs from the
+  mirror live in the guest's own root, so for APK only the `.apk` itself
+  is seen; file-level stats come from overlay-layer use.
 
 ## Nix
 

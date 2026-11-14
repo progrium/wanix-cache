@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 
 	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/h9index"
@@ -40,6 +41,15 @@ type FS struct {
 	Index *h9index.Store
 
 	views viewSet // see view.go
+
+	// Synthetic, if set, are read-only files in /.cache (SyntheticDir)
+	// whose bytes are generated when they are looked up, such as
+	// /.cache/usage. Call InitSynthetic before serving.
+	Synthetic map[string]SyntheticFunc
+
+	synthMu    sync.Mutex
+	synthDir   uint64
+	synthSnaps map[string]synthSnap
 }
 
 // lookup finds name in dir, faulting in a unit on a miss.
@@ -112,6 +122,9 @@ func (f *FS) Lookup(ctx context.Context, dir ninep.Node, name string) (ninep.Nod
 			return indexNode(x), err
 		}
 	}
+	if in, ok, err := f.synthLookup(ctx, dir.Ino, name); err != nil || ok {
+		return node(in), err
+	}
 	in, err := f.lookup(ctx, dir.Ino, name)
 	if err != nil {
 		return ninep.Node{}, err
@@ -123,6 +136,13 @@ func (f *FS) Lookup(ctx context.Context, dir ninep.Node, name string) (ninep.Nod
 }
 
 func (f *FS) ReadDir(ctx context.Context, dir ninep.Node, after string, limit int) ([]ninep.Entry, string, bool, error) {
+	if f.isSynthDir(dir.Ino) {
+		des := f.synthEntries(ctx, after)
+		if len(des) > 0 {
+			after = des[len(des)-1].Name
+		}
+		return synthEntriesNineP(des), after, true, nil
+	}
 	var des []meta.Dirent
 	var err error
 	if subsys.IsVirtual(dir.Ino) {
@@ -199,6 +219,9 @@ func (bytesFile) Close() error { return nil }
 func (f *FS) Open(ctx context.Context, n ninep.Node) (ninep.File, error) {
 	if _, _, ok := h9index.IsFileIno(n.Ino); ok {
 		return f.openIndex(ctx, n.Ino)
+	}
+	if isSynth(n.Ino) {
+		return f.synthOpen(ctx, n.Ino)
 	}
 	in, err := f.Meta.Get(ctx, n.Ino)
 	if err != nil {
