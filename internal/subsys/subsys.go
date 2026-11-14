@@ -91,8 +91,17 @@ type Evicter interface {
 	OnEvict(ctx context.Context, key Key) error
 }
 
+// Scaffolder is optionally implemented by subsystems with fixed
+// directories (such as /nix/store) that must exist before any unit is
+// fetched. Dirs are relative to /<name>/ and created at registration.
+type Scaffolder interface {
+	Dirs() []string
+}
+
 // Sink receives a unit's tree during a fill. Paths are relative to the unit
-// root, slash separated, with parents created before children. Entries become
+// root, slash separated, with parents created before children. A unit whose
+// root is a single file or symlink (a Nix store path can be) calls File("")
+// or Symlink("", ...) as its only entry. Entries become
 // visible to readers as soon as each call returns, and a regular file's
 // bytes become readable as they are written.
 type Sink interface {

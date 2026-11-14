@@ -20,6 +20,7 @@ type DiskSpool struct {
 
 	mu    sync.Mutex
 	files map[uint64]*sfile
+	units map[int64]int64 // bytes per unit still counted in bytes
 }
 
 type sfile struct {
@@ -42,12 +43,14 @@ func OpenDiskSpool(dir string) (*DiskSpool, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &DiskSpool{dir: dir, files: map[uint64]*sfile{}}
+	s := &DiskSpool{dir: dir, files: map[uint64]*sfile{}, units: map[int64]int64{}}
 	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
 		if info, err := d.Info(); err == nil {
+			unit, _ := strconv.ParseInt(filepath.Base(filepath.Dir(p)), 10, 64)
+			s.units[unit] += info.Size()
 			s.bytes.Add(info.Size())
 		}
 		return nil
@@ -96,7 +99,7 @@ func (w *spoolWriter) Write(p []byte) (int, error) {
 	}
 	n, err := out.Write(p)
 	if n > 0 {
-		w.s.bytes.Add(int64(n))
+		w.s.count(f.unit, int64(n))
 		f.mu.Lock()
 		f.written += int64(n)
 		f.cond.Broadcast()
@@ -218,6 +221,31 @@ func (s *DiskSpool) Sync(unit int64) error {
 	return df.Sync()
 }
 
+func (s *DiskSpool) count(unit, n int64) {
+	s.mu.Lock()
+	s.units[unit] += n
+	s.mu.Unlock()
+	s.bytes.Add(n)
+}
+
+// Release stops counting a unit's spool files in Bytes while they stay on
+// disk and readable, and returns how many bytes it stopped counting. Ingest
+// calls it once the unit's bytes are in the CAS, just before the commit that
+// makes the unit resident, so the quota never counts them twice; it passes
+// the result to Unrelease if that commit fails. Remove then deletes the
+// files without counting them again.
+func (s *DiskSpool) Release(unit int64) int64 {
+	s.mu.Lock()
+	n := s.units[unit]
+	delete(s.units, unit)
+	s.mu.Unlock()
+	s.bytes.Add(-n)
+	return n
+}
+
+// Unrelease undoes Release.
+func (s *DiskSpool) Unrelease(unit, n int64) { s.count(unit, n) }
+
 // Remove implements Spool.
 func (s *DiskSpool) Remove(unit int64) error {
 	s.mu.Lock()
@@ -227,20 +255,10 @@ func (s *DiskSpool) Remove(unit int64) error {
 		}
 	}
 	s.mu.Unlock()
-	d := s.unitDir(unit)
-	var size int64
-	filepath.WalkDir(d, func(p string, de os.DirEntry, err error) error {
-		if err == nil && !de.IsDir() {
-			if info, err := de.Info(); err == nil {
-				size += info.Size()
-			}
-		}
-		return nil
-	})
-	if err := os.RemoveAll(d); err != nil {
+	if err := os.RemoveAll(s.unitDir(unit)); err != nil {
 		return err
 	}
-	s.bytes.Add(-size)
+	s.Release(unit)
 	return nil
 }
 

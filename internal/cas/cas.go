@@ -65,7 +65,7 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	q := &quotaStore{Storage: raw, max: maxBytes}
+	q := &quotaStore{Storage: statNoCancel{raw}, max: maxBytes}
 	err = blobserver.EnumerateAll(context.Background(), raw, func(sr blob.SizedRef) error {
 		q.used += int64(sr.Size)
 		return nil

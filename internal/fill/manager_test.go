@@ -438,3 +438,114 @@ func randBytes(n int) []byte {
 }
 
 var _ = bytes.Equal
+
+// TestNonDirRoot fills units whose root is a single file or a symlink, and
+// refaults the file one in place.
+func TestNonDirRoot(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, t.TempDir(), 0, Options{})
+	s := &fakeSub{}
+	s.add("f", "", "just a file")
+	s.add("l", "", "->f")
+	s.add("bad", "", "x", "y", "z")
+	if err := e.m.Register(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.m.Ensure(ctx, "fake", "f", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.read(t, "/fake/f"); got != "just a file" {
+		t.Fatalf("file root = %q", got)
+	}
+	e.m.Wait(ctx)
+	u, _ := e.db.Unit(ctx, "fake", "f")
+	root, err := e.db.Get(ctx, u.Root)
+	if err != nil || root.Kind != meta.KindFile || u.State != meta.UnitResident || root.Content == "" {
+		t.Fatalf("unit %+v root %+v %v", u, root, err)
+	}
+
+	tx, _ := e.db.Begin(ctx)
+	tx.SetContent(root.Ino, "")
+	tx.SetUnitState(u.ID, meta.UnitResident, meta.UnitEvicted)
+	tx.Commit()
+	if got := e.read(t, "/fake/f"); got != "just a file" {
+		t.Fatalf("after refault = %q", got)
+	}
+	if u2, _ := e.db.Unit(ctx, "fake", "f"); u2.Root != root.Ino {
+		t.Errorf("refault changed the root: %d -> %d", root.Ino, u2.Root)
+	}
+
+	if _, err := e.m.Ensure(ctx, "fake", "l", true); err != nil {
+		t.Fatal(err)
+	}
+	ul, _ := e.db.Unit(ctx, "fake", "l")
+	if in, err := e.db.Lookup(ctx, meta.RootIno, "fake"); err != nil {
+		t.Fatal(err)
+	} else if l, err := e.db.Lookup(ctx, in.Ino, "l"); err != nil || l.Kind != meta.KindSymlink || l.Target != "f" || l.Ino != ul.Root {
+		t.Fatalf("symlink root %+v %v (unit root %d)", l, err, ul.Root)
+	}
+
+	if _, err := e.m.Ensure(ctx, "fake", "bad", true); err == nil {
+		t.Fatal("a file root followed by more entries was accepted")
+	}
+	if _, err := e.db.Unit(ctx, "fake", "bad"); err == nil {
+		if fk, _ := e.db.Lookup(ctx, meta.RootIno, "fake"); true {
+			if _, err := e.db.Lookup(ctx, fk.Ino, "bad"); err == nil {
+				t.Error("failed fill left its root behind")
+			}
+		}
+	}
+	e.m.Wait(ctx)
+}
+
+type scaffoldSub struct{ fakeSub }
+
+func (*scaffoldSub) Dirs() []string { return []string{"store", "a/b"} }
+
+func TestScaffolder(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, t.TempDir(), 0, Options{})
+	if err := e.m.Register(ctx, &scaffoldSub{}); err != nil {
+		t.Fatal(err)
+	}
+	ino := meta.RootIno
+	for _, n := range []string{"fake", "a", "b"} {
+		in, err := e.db.Lookup(ctx, ino, n)
+		if err != nil || in.Kind != meta.KindDir {
+			t.Fatalf("%s: %+v %v", n, in, err)
+		}
+		ino = in.Ino
+	}
+	fk, _ := e.db.Lookup(ctx, meta.RootIno, "fake")
+	if _, err := e.db.Lookup(ctx, fk.Ino, "store"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNoDoubleCount checks the quota never counts a unit in both the CAS
+// and the spool once it is resident.
+func TestNoDoubleCount(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, t.TempDir(), 0, Options{})
+	s := &fakeSub{}
+	s.add("u", "f", string(randBytes(64<<10)))
+	e.m.Register(ctx, s)
+	var bad atomic.Int64
+	e.m.Watch(func(ev UnitEvent) {
+		if ev.To == meta.UnitResident {
+			bad.Store(e.spool.Bytes())
+		}
+	})
+	if _, err := e.m.Ensure(ctx, "fake", "u", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.m.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := bad.Load(); n != 0 {
+		t.Errorf("spool still counted %d bytes when the unit became resident", n)
+	}
+	if n := e.spool.Bytes(); n != 0 {
+		t.Errorf("spool holds %d bytes after Wait", n)
+	}
+}

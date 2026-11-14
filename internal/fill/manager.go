@@ -48,6 +48,9 @@ type LocalManager struct {
 	wg     sync.WaitGroup
 	ingest chan int64
 	sem    chan struct{}
+	// ingesting counts ingestUnit calls in progress, so Wait covers the
+	// gap between the resident commit and the spool removal.
+	ingesting atomic.Int64
 	resume chan struct{}
 
 	mu       sync.Mutex
@@ -170,9 +173,15 @@ func (m *LocalManager) Register(ctx context.Context, s subsys.Subsystem) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tx.MkdirAll("/" + name); err != nil {
-		tx.Rollback()
-		return err
+	dirs := []string{""}
+	if sc, ok := s.(subsys.Scaffolder); ok {
+		dirs = append(dirs, sc.Dirs()...)
+	}
+	for _, d := range dirs {
+		if _, err := tx.MkdirAll(path.Join("/"+name, d)); err != nil {
+			tx.Rollback()
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -332,20 +341,23 @@ func (m *LocalManager) runFill(s subsys.Subsystem, key subsys.Key, f *flight) (e
 		tx.Rollback()
 		return err
 	}
+	mount := path.Clean("/" + info.Mount)
+	if info.Mount == "" {
+		mount = path.Clean("/" + string(key))
+	}
+	if mount == "/" {
+		tx.Rollback()
+		return fmt.Errorf("fill: %s/%s: empty mount", sub, key)
+	}
+	rootParent, err := tx.MkdirAll("/" + sub + path.Dir(mount))
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	rootName := path.Base(mount)
 	root := u.Root
 	if root == 0 {
-		mount := path.Clean("/" + info.Mount)
-		if info.Mount == "" {
-			mount = "/" + string(key)
-		}
-		if mount == "/" {
-			tx.Rollback()
-			return fmt.Errorf("fill: %s/%s: empty mount", sub, key)
-		}
-		parent, err := tx.MkdirAll("/" + sub + path.Dir(mount))
-		if err == nil {
-			root, err = tx.Mkdir(parent, path.Base(mount), 0o555, time.Now(), id)
-		}
+		root, err = tx.Mkdir(rootParent, rootName, 0o555, time.Now(), id)
 		if err == nil {
 			err = tx.SetUnitManifest(id, root, 0)
 		}
@@ -364,7 +376,10 @@ func (m *LocalManager) runFill(s subsys.Subsystem, key subsys.Key, f *flight) (e
 	f.start()
 
 	sink := &fillSink{m: m, ctx: ctx, unit: id, refault: from == meta.UnitEvicted, res: res.(*reservation),
-		dirs: map[string]uint64{".": root}}
+		rootParent: rootParent, rootName: rootName, root: root, dirs: map[string]uint64{}}
+	if rin, err := m.db.Get(ctx, root); err == nil && rin.Kind == meta.KindDir {
+		sink.dirs["."] = root
+	}
 	err = s.Fetch(ctx, key, sink)
 	if err == nil {
 		err = sink.finish()
@@ -385,7 +400,7 @@ func (m *LocalManager) runFill(s subsys.Subsystem, key subsys.Key, f *flight) (e
 	if err != nil {
 		return err
 	}
-	if err := tx.SetUnitManifest(id, root, sink.logical); err == nil {
+	if err := tx.SetUnitManifest(id, sink.root, sink.logical); err == nil {
 		err = tx.SetUnitState(id, meta.UnitFetching, meta.UnitSpooled)
 	}
 	if err != nil {
@@ -700,6 +715,7 @@ func (m *LocalManager) exists(ctx context.Context, p string) bool {
 // orderly shutdown.
 func (m *LocalManager) Wait(ctx context.Context) error {
 	for {
+		busy := m.ingesting.Load()
 		m.mu.Lock()
 		n := len(m.flights)
 		m.mu.Unlock()
@@ -707,7 +723,7 @@ func (m *LocalManager) Wait(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if n == 0 && len(spooled) == 0 {
+		if n == 0 && busy == 0 && len(spooled) == 0 {
 			return nil
 		}
 		select {
@@ -762,7 +778,13 @@ func (m *LocalManager) ingestLoop() {
 // the unit to resident in one transaction, and drops its spool. No write
 // transaction is held across CAS puts.
 func (m *LocalManager) ingestUnit(id int64) error {
+	m.ingesting.Add(1)
+	defer m.ingesting.Add(-1)
 	ctx := m.ctx
+	// Every blob put or found stays safe from a GC sweep until the content
+	// refs that keep it are committed.
+	sess := m.store.Session()
+	defer sess.Close()
 	u, err := m.db.UnitByID(ctx, id)
 	if err != nil || u.State != meta.UnitSpooled {
 		return err
@@ -791,7 +813,7 @@ func (m *LocalManager) ingestUnit(id int64) error {
 		wg.Add(1)
 		go func() {
 			defer func() { <-m.sem; wg.Done() }()
-			digest, ref, err := m.ingestFile(ctx, in)
+			digest, ref, err := m.ingestFile(ctx, sess, in)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -807,8 +829,12 @@ func (m *LocalManager) ingestUnit(id int64) error {
 	if firstErr != nil {
 		return firstErr
 	}
+	// The bytes are in the CAS now: stop counting the spool copy so the
+	// quota does not count the unit twice until the spool is removed.
+	released := m.spool.Release(id)
 	tx, err := m.db.Begin(ctx)
 	if err != nil {
+		m.spool.Unrelease(id, released)
 		return err
 	}
 	for _, r := range results {
@@ -822,11 +848,13 @@ func (m *LocalManager) ingestUnit(id int64) error {
 	if err == nil {
 		err = tx.SetUnitState(id, meta.UnitSpooled, meta.UnitResident)
 	}
-	if err != nil {
+	if err == nil {
+		err = tx.Commit()
+	} else {
 		tx.Rollback()
-		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err != nil {
+		m.spool.Unrelease(id, released)
 		return err
 	}
 	if err := m.spool.Remove(id); err != nil {
@@ -839,7 +867,7 @@ func (m *LocalManager) ingestUnit(id int64) error {
 
 // ingestFile stores one spool file in the CAS, skipping the chunker when
 // its whole-file digest is already known.
-func (m *LocalManager) ingestFile(ctx context.Context, in meta.Inode) (digest, ref string, err error) {
+func (m *LocalManager) ingestFile(ctx context.Context, sess *cas.Session, in meta.Inode) (digest, ref string, err error) {
 	f, err := m.spool.Open(in.Ino)
 	if err != nil {
 		return "", "", err
@@ -854,10 +882,15 @@ func (m *LocalManager) ingestFile(ctx context.Context, in meta.Inode) (digest, r
 	if err != nil {
 		return "", "", err
 	}
-	if !ok {
-		if ref, err = m.store.Put(ctx, io.NewSectionReader(f, 0, in.Size)); err != nil {
-			return "", "", err
+	if ok {
+		// Hold fails if a sweep removed a blob since the ref was read;
+		// put the bytes again then.
+		if _, err := sess.Hold(ctx, ref); err == nil {
+			return digest, ref, nil
 		}
+	}
+	if ref, err = sess.Put(ctx, io.NewSectionReader(f, 0, in.Size)); err != nil {
+		return "", "", err
 	}
 	return digest, ref, nil
 }
@@ -870,11 +903,18 @@ type fillSink struct {
 	refault bool
 	res     *reservation
 
+	// The unit root's place in the namespace. A Fetch whose first entry is
+	// File("") or Symlink("", ...) replaces the empty root directory.
+	rootParent uint64
+	rootName   string
+
 	mu      sync.Mutex
+	root    uint64
 	dirs    map[string]uint64 // unit-relative dir path -> ino
 	open    []*sinkFile
 	logical int64
 	digest  string
+	started bool // an entry was added, so the root can no longer change
 }
 
 func clean(p string) (dir, name string, err error) {
@@ -892,6 +932,7 @@ func clean(p string) (dir, name string, err error) {
 func (s *fillSink) parent(dir string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.started = true
 	ino, ok := s.dirs[dir]
 	if !ok {
 		return 0, fmt.Errorf("fill: parent directory %q not created", dir)
@@ -962,16 +1003,17 @@ func (s *fillSink) Dir(p string, mode fs.FileMode, mtime time.Time) error {
 }
 
 func (s *fillSink) File(p string, mode fs.FileMode, size int64, mtime time.Time) (io.WriteCloser, error) {
-	dir, name, err := clean(p)
-	if err != nil {
-		return nil, err
-	}
-	parent, err := s.parent(dir)
+	parent, name, isRoot, err := s.place(p)
 	if err != nil {
 		return nil, err
 	}
 	var ino uint64
 	err = s.do(func(tx *meta.Tx) error {
+		if isRoot {
+			if err := s.replaceRoot(tx, meta.KindFile); err != nil {
+				return err
+			}
+		}
 		old, ok, err := s.existing(tx, parent, name)
 		if err != nil {
 			return err
@@ -981,6 +1023,9 @@ func (s *fillSink) File(p string, mode fs.FileMode, size int64, mtime time.Time)
 			return tx.UpdateFile(ino, uint32(mode.Perm()), max(size, 0), mtime)
 		}
 		ino, err = tx.File(parent, name, mode, max(size, 0), mtime, "", s.unit)
+		if err == nil && isRoot {
+			err = s.setRoot(tx, ino)
+		}
 		return err
 	})
 	if err != nil {
@@ -1001,21 +1046,69 @@ func (s *fillSink) File(p string, mode fs.FileMode, size int64, mtime time.Time)
 }
 
 func (s *fillSink) Symlink(p, target string, mtime time.Time) error {
-	dir, name, err := clean(p)
-	if err != nil {
-		return err
-	}
-	parent, err := s.parent(dir)
+	parent, name, isRoot, err := s.place(p)
 	if err != nil {
 		return err
 	}
 	return s.do(func(tx *meta.Tx) error {
+		if isRoot {
+			if err := s.replaceRoot(tx, meta.KindSymlink); err != nil {
+				return err
+			}
+		}
 		if _, ok, err := s.existing(tx, parent, name); ok || err != nil {
 			return err
 		}
-		_, err := tx.Symlink(parent, name, target, mtime, s.unit)
+		ino, err := tx.Symlink(parent, name, target, mtime, s.unit)
+		if err == nil && isRoot {
+			err = s.setRoot(tx, ino)
+		}
 		return err
 	})
+}
+
+// place resolves p to its parent directory and name. The empty path is the
+// unit root itself, allowed only as the first entry of a fill.
+func (s *fillSink) place(p string) (parent uint64, name string, isRoot bool, err error) {
+	if strings.Trim(p, "/.") == "" {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.started {
+			return 0, "", false, errors.New("fill: a non-directory unit root must be the only entry")
+		}
+		s.started = true
+		delete(s.dirs, ".")
+		return s.rootParent, s.rootName, true, nil
+	}
+	dir, name, err := clean(p)
+	if err != nil {
+		return 0, "", false, err
+	}
+	parent, err = s.parent(dir)
+	return parent, name, false, err
+}
+
+// replaceRoot drops the placeholder root directory, unless the root is
+// already of kind k (a refault of a non-directory unit).
+func (s *fillSink) replaceRoot(tx *meta.Tx, k meta.Kind) error {
+	in, err := tx.Lookup(s.rootParent, s.rootName)
+	if err != nil {
+		return err
+	}
+	if in.Kind == k {
+		return nil
+	}
+	return tx.ReplaceEmptyDir(s.rootParent, s.rootName)
+}
+
+func (s *fillSink) setRoot(tx *meta.Tx, ino uint64) error {
+	if err := tx.SetUnitManifest(s.unit, ino, 0); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.root = ino
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *fillSink) Hardlink(p, target string) error {

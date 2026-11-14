@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -108,5 +109,30 @@ func (t *Tx) DeleteUnitTree(unit int64) error {
 		return err
 	}
 	_, err := t.tx.ExecContext(t.ctx, `DELETE FROM inode WHERE unit = ?`, unit)
+	return err
+}
+
+// ReplaceEmptyDir removes the empty directory named name in parent so a
+// non-directory can take its place (a unit whose root turns out to be a
+// single file or symlink). It fails if the directory has entries.
+func (t *Tx) ReplaceEmptyDir(parent uint64, name string) error {
+	in, err := t.Lookup(parent, name)
+	if err != nil {
+		return err
+	}
+	if in.Kind != KindDir {
+		return fmt.Errorf("meta: %q: %w", name, ErrNotDir)
+	}
+	var n int
+	if err := t.tx.QueryRowContext(t.ctx, `SELECT count(*) FROM dirent WHERE parent = ?`, in.Ino).Scan(&n); err != nil {
+		return err
+	}
+	if n != 0 {
+		return fmt.Errorf("meta: %q is not empty", name)
+	}
+	if _, err := t.tx.ExecContext(t.ctx, `DELETE FROM dirent WHERE parent = ? AND name = ?`, parent, name); err != nil {
+		return err
+	}
+	_, err = t.tx.ExecContext(t.ctx, `DELETE FROM inode WHERE ino = ?`, in.Ino)
 	return err
 }
