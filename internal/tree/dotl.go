@@ -13,6 +13,7 @@ import (
 	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
 // DotL serves the namespace read-only over 9P2000.L, which is what Linux
@@ -131,7 +132,7 @@ func (n *lnode) Walk(names []string) ([]p9.QID, p9.File, error) {
 			}
 		}
 		if name == ".." {
-			next, err = n.fs.Meta.Get(ctx, cur.Parent)
+			next, err = n.fs.get(ctx, cur.Parent)
 		} else {
 			next, err = n.fs.lookup(ctx, cur.Ino, name)
 		}
@@ -299,6 +300,12 @@ func (n *lnode) readdir(ctx context.Context, offset uint64, count uint32, shift 
 	var des []meta.Dirent
 	var err error
 	switch {
+	case subsys.IsVirtual(n.in.Ino):
+		des, err = n.fs.viewReadDir(ctx, n.in.Ino)
+		if err == nil {
+			des = des[min(offset, uint64(len(des))):]
+			des = des[:min(limit, len(des))]
+		}
 	case offset == 0:
 		des, err = n.fs.Meta.ReadDir(ctx, n.in.Ino, "", limit)
 	case offset == n.lastOff && n.lastName != "":

@@ -11,6 +11,7 @@ import (
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
 // IndexSources returns the h9index sources for fs: the tree as the 9P2000
@@ -60,7 +61,7 @@ type nineSource struct {
 }
 
 func (s nineSource) Stat(ctx context.Context, ino uint64) (h9index.Child, error) {
-	in, err := s.fs.Meta.Get(ctx, ino)
+	in, err := s.fs.get(ctx, ino)
 	if err != nil {
 		return h9index.Child{}, err
 	}
@@ -88,7 +89,7 @@ type dotlSource struct {
 }
 
 func (s dotlSource) Stat(ctx context.Context, ino uint64) (h9index.Child, error) {
-	in, err := s.fs.Meta.Get(ctx, ino)
+	in, err := s.fs.get(ctx, ino)
 	if err != nil {
 		return h9index.Child{}, err
 	}
@@ -96,7 +97,16 @@ func (s dotlSource) Stat(ctx context.Context, ino uint64) (h9index.Child, error)
 }
 
 func (s dotlSource) ReadDir(ctx context.Context, ino uint64, after string, limit int) ([]h9index.Child, string, bool, error) {
-	des, err := s.fs.Meta.ReadDir(ctx, ino, after, limit)
+	var des []meta.Dirent
+	var err error
+	if subsys.IsVirtual(ino) {
+		var done bool
+		if des, done, err = s.fs.viewPage(ctx, ino, after, limit); err == nil && done {
+			limit = len(des) + 1
+		}
+	} else {
+		des, err = s.fs.Meta.ReadDir(ctx, ino, after, limit)
+	}
 	if err != nil {
 		return nil, after, false, err
 	}

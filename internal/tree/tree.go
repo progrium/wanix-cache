@@ -12,6 +12,7 @@ import (
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/subsys"
 )
 
 // FS adapts meta + cas to ninep.FS.
@@ -37,10 +38,15 @@ type FS struct {
 	// has a read-only /.h9index, the variant for the server's transport.
 	// It shadows a real file of that name.
 	Index *h9index.Store
+
+	views viewSet // see view.go
 }
 
 // lookup finds name in dir, faulting in a unit on a miss.
 func (f *FS) lookup(ctx context.Context, dir uint64, name string) (meta.Inode, error) {
+	if in, ok, err := f.viewLookup(ctx, dir, name); ok {
+		return in, err
+	}
 	in, err := f.Meta.Lookup(ctx, dir, name)
 	if err == nil || f.Faults == nil || !errors.Is(err, meta.ErrNotExist) {
 		return in, err
@@ -92,11 +98,11 @@ func (f *FS) Root(ctx context.Context) (ninep.Node, error) {
 }
 
 func (f *FS) Parent(ctx context.Context, dir ninep.Node) (ninep.Node, error) {
-	in, err := f.Meta.Get(ctx, dir.Ino)
+	in, err := f.get(ctx, dir.Ino)
 	if err != nil {
 		return ninep.Node{}, err
 	}
-	p, err := f.Meta.Get(ctx, in.Parent)
+	p, err := f.get(ctx, in.Parent)
 	return node(p), err
 }
 
@@ -117,7 +123,16 @@ func (f *FS) Lookup(ctx context.Context, dir ninep.Node, name string) (ninep.Nod
 }
 
 func (f *FS) ReadDir(ctx context.Context, dir ninep.Node, after string, limit int) ([]ninep.Entry, string, bool, error) {
-	des, err := f.Meta.ReadDir(ctx, dir.Ino, after, limit)
+	var des []meta.Dirent
+	var err error
+	if subsys.IsVirtual(dir.Ino) {
+		var done bool
+		if des, done, err = f.viewPage(ctx, dir.Ino, after, limit); err == nil && done {
+			limit = len(des) + 1 // report done below
+		}
+	} else {
+		des, err = f.Meta.ReadDir(ctx, dir.Ino, after, limit)
+	}
 	if err != nil {
 		return nil, after, false, err
 	}

@@ -12,6 +12,7 @@ import (
 func addSubsystemFlags(fl *flag.FlagSet) {
 	addNixFlags(fl)
 	addAPKFlags(fl)
+	addOCIFlags(fl)
 }
 
 // registerSubsystems registers every subsystem with the fill manager. Each
@@ -23,6 +24,9 @@ func registerSubsystems(ctx context.Context, m *fill.LocalManager, dir string) e
 		return err
 	}
 	if err := registerAPK(ctx, m); err != nil {
+		return err
+	}
+	if err := registerOCI(ctx, m); err != nil {
 		return err
 	}
 	return nil

@@ -19,7 +19,8 @@ the debug savings mode, and the subsystems come in later phases.
 | `internal/tree` | The namespace with bytes from the CAS: the 9P2000.L server (`dotl.go`) and the adapter for the plain 9P2000 server |
 | `internal/ninep` | A small read-only 9P2000 server |
 | `internal/ingest` | Imports a local directory as a unit (stand-in for subsystem fetchers) |
-| `internal/subsys` | The `Subsystem` interface each subsystem implements, and the conventions below |
+| `internal/subsys` | The `Subsystem` interface each subsystem implements, `Viewer` for virtual views, and the conventions below |
+| `internal/subsys/oci` | OCI images: registry client with anonymous token auth, layer units, merged rootfs views |
 | `internal/fill` | The fill-path API: unit manager, spool, quota, reclaimer hook (implementation in progress) |
 | `internal/h9index` | Generates, stores and serves each root's `/.h9index` (hyper9's mount-index) from metadata |
 | `internal/gc` | Eviction and blob GC: global refcounts, LRU with watermarks, pins, sweep, audit |
@@ -178,6 +179,45 @@ needed on the cache side.
 - `WANIX_NIX_UPSTREAM=1 go test -run Upstream ./internal/subsys/nix` runs the
   end-to-end check: a cold 9P read of `hello`, a closure read, and real
   `nix copy` from the endpoint with signatures verified.
+
+## OCI
+
+Images are a distribution format for H9 roots; nothing here runs them.
+Walking `/oci/<registry>/<repo>@<tag|digest>/` (for example
+`/oci/docker.io/library/alpine@3.20/`) is the whole pull: H9 can mount
+that path as a 9P root directly.
+
+- **First access** resolves the reference (index, then the platform
+  manifest for `-oci-platform`, then the config) and starts every layer's
+  fill at once, top layer first, at most `-oci-downloads` per registry.
+  Tags are trusted for `-oci-tag-ttl`; if the registry is unreachable the
+  cached resolution is used. Digest references never re-resolve.
+- **Layers are units** keyed by diff_id, mounted at `/oci/layers/<diff_id>/`,
+  stored unpacked file by file (gzip, zstd and plain tar layers), so files
+  dedupe across layers, images and subsystems. The compressed blob digest
+  and the diff_id are both verified; `oci_blob` keeps the
+  compressed-digest-to-diff_id mapping.
+- **The merged rootfs is a view.** Its directories are virtual
+  (`subsys.Viewer`, inode numbers with bit 61 set); its files are the real
+  inodes of the winning layer, so reads go through the fill path and are
+  served while the layer is still downloading. Whiteouts and opaque
+  directories are applied at lookup time: a name is looked up from the top
+  layer down, and a layer still being fetched is waited on only if the name
+  is not there yet. A listing waits for the layers it merges.
+- **Auth** is anonymous bearer tokens (Docker Hub, GHCR, Quay). Registries
+  that need credentials are not supported yet.
+- **Eviction is per image.** An image in use pins its layers (released
+  after 10 minutes idle). Through `EvictionOrder` the reclaimer evicts
+  layers no live image uses; when there are none, the least recently used
+  image is marked evicted, releasing the layers only it used. `OnEvict`
+  refuses a layer a live image still uses. Using an image again revives it.
+- Once every layer's listing is final, the rootfs gets a `/.h9index`.
+- Not yet: eStargz / zstd:chunked per-file lazy fetch, devices and FIFOs
+  (skipped), setuid bits and ownership (the namespace keeps permission
+  bits only), a repeated tar entry (the first one wins).
+
+`WANIX_OCI_LIVE=1 go test -run Live ./internal/subsys/oci` pulls
+alpine:3.20 from Docker Hub through the 9P2000.L server.
 
 ## Measurements (phase 1)
 

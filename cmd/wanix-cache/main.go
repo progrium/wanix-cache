@@ -151,6 +151,11 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 	if err := registerSubsystems(context.Background(), mgr, dir); err != nil {
 		return err
 	}
+	for name, v := range viewers {
+		if err := fs.AddViewer(context.Background(), name, v); err != nil {
+			return err
+		}
+	}
 	if err := startGC(db, store, mgr, quota, max); err != nil {
 		return err
 	}
