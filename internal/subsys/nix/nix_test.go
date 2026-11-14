@@ -359,6 +359,18 @@ func TestReadThrough(t *testing.T) {
 		t.Errorf("bin/app inode %+v, %v", in, err)
 	}
 
+	// File and symlink store paths are file and symlink roots.
+	for sp, kind := range map[StorePath]meta.Kind{filePath: meta.KindFile, linkPath: meta.KindSymlink} {
+		if _, err := e.m.Ensure(ctx, Name, subsys.Key(sp), true); err != nil {
+			t.Fatal(err)
+		}
+		u, _ := e.db.Unit(ctx, Name, string(sp))
+		in, _ := e.db.Lookup(ctx, mustLookup(t, e, "/nix/store"), string(sp))
+		if in.Kind != kind || in.Ino != u.Root {
+			t.Errorf("%s root is %v (ino %d, unit root %d), want %v", sp, in.Kind, in.Ino, u.Root, kind)
+		}
+	}
+
 	// Identical bytes in two store paths are one content object.
 	var n int
 	e.db.SQL().QueryRow(`SELECT refs FROM content WHERE size = ?`, len(fixtureTree["lib/libfoo.so"].Data)).Scan(&n)
@@ -599,3 +611,16 @@ func TestBinaryCache(t *testing.T) {
 }
 
 var _ usage.Derived = (*Subsystem)(nil)
+
+func mustLookup(t *testing.T, e *env, p string) uint64 {
+	t.Helper()
+	ino := meta.RootIno
+	for _, name := range strings.Split(strings.Trim(p, "/"), "/") {
+		in, err := e.db.Lookup(e.ctx, ino, name)
+		if err != nil {
+			t.Fatalf("lookup %s: %v", p, err)
+		}
+		ino = in.Ino
+	}
+	return ino
+}

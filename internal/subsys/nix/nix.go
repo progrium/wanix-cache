@@ -45,11 +45,6 @@ const Name = "nix"
 // closurePrefix marks closure unit keys.
 const closurePrefix = "closure:"
 
-// rootEntry holds a store path whose NAR root is a file or symlink, inside
-// the unit's root directory, until the fill path supports non-directory
-// unit roots.
-const rootEntry = ".nar-root"
-
 // storeMtime is the mtime Nix gives everything in the store.
 var storeMtime = time.Unix(1, 0)
 
@@ -98,6 +93,7 @@ var (
 	_ subsys.Subsystem       = (*Subsystem)(nil)
 	_ subsys.Evicter         = (*Subsystem)(nil)
 	_ subsys.EvictionOrderer = (*Subsystem)(nil)
+	_ subsys.Scaffolder      = (*Subsystem)(nil)
 )
 
 // New returns the Nix subsystem using db for its tables.
@@ -127,10 +123,8 @@ func New(db *meta.DB, opts Options) (*Subsystem, error) {
 
 // Attach gives the subsystem the fill manager it is registered with, so
 // closures and the binary cache read member paths from the cache (faulting
-// them in as units) instead of straight from upstream. It also creates the
-// empty /nix/store and /nix/closure directories, so a guest can walk into
-// them (and a miss inside them can fault) before anything is cached. Call
-// it after Register.
+// them in as units) instead of straight from upstream. Call it after
+// Register.
 func (s *Subsystem) Attach(ctx context.Context, m fill.Manager) error {
 	s.mu.Lock()
 	s.mgr = m
@@ -138,18 +132,13 @@ func (s *Subsystem) Attach(ctx context.Context, m fill.Manager) error {
 	if s.opts.Indexer != nil {
 		m.Watch(s.indexClosure)
 	}
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, d := range []string{"/nix/store", "/nix/closure"} {
-		if _, err := tx.MkdirAll(d); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }
+
+// Dirs implements subsys.Scaffolder: /nix/store and /nix/closure exist
+// before anything is cached, so a guest can walk into them and a miss
+// inside them faults.
+func (s *Subsystem) Dirs() []string { return []string{"store", "closure"} }
 
 // indexClosure indexes a closure root once its manifest is complete. Its
 // members were all filled (spooled or resident) before it, by Fetch.
@@ -358,7 +347,7 @@ type sinkHandler struct {
 
 func (h *sinkHandler) path(p string) string {
 	if p == "" && h.prefix == "" {
-		return rootEntry
+		return "" // a file or symlink root replaces the unit's root directory
 	}
 	return path.Join(h.prefix, p)
 }
@@ -459,15 +448,6 @@ func (t *unitTree) Root() (Node, error) {
 	in, err := t.db.Get(t.ctx, t.root)
 	if err != nil {
 		return Node{}, err
-	}
-	if in.Kind == meta.KindDir {
-		des, err := t.db.ReadDir(t.ctx, in.Ino, "", 2)
-		if err != nil {
-			return Node{}, err
-		}
-		if len(des) == 1 && des[0].Name == rootEntry {
-			in = des[0].Inode
-		}
 	}
 	return nodeOf(in)
 }
