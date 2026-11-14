@@ -4,6 +4,11 @@
 //	wanix-cache import [-data DIR] [-max-gib N] -key NAME SRC
 //	wanix-cache stats  [-data DIR]
 //	wanix-cache units  [-data DIR] [-subsystem NAME]
+//	wanix-cache gc     [-data DIR] [-max-gib N] [-high F] [-low F]
+//	wanix-cache evict  [-data DIR] [-subsystem NAME] -key KEY
+//	wanix-cache refault [-data DIR] -key KEY SRC
+//	wanix-cache audit  [-data DIR] [-fix] [-deep]
+//	wanix-cache pin    [-data DIR] [-subsystem NAME] [-reason R] [-unpin] [-key KEY]
 package main
 
 import (
@@ -21,6 +26,7 @@ import (
 
 	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
+	"github.com/progrium/wanix-cache/internal/gc"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
@@ -34,7 +40,12 @@ commands:
   serve    serve the cache read-only over 9P2000.L (and optionally plain 9P2000)
   import   import a local directory as a unit under /local/<key>
   stats    print store totals
-  units    list units`)
+  units    list units
+  gc       sweep unreferenced blobs and evict down to the low watermark
+  evict    evict one unit now (its manifest stays; a read refaults it)
+  refault  bring an evicted local unit back from its source directory
+  audit    check refcounts against inodes and blobs on disk (-fix repairs)
+  pin      pin a unit against eviction (-unpin removes; no -key lists pins)`)
 	os.Exit(2)
 }
 
@@ -58,7 +69,7 @@ func main() {
 		err = serve(*data, *addrL, *addr, *gib<<30, *workers)
 	case "import":
 		key := fl.String("key", "", "unit key (defaults to the source directory's name)")
-		gib := fl.Int64("max-gib", 0, "quota on unique CAS bytes, GiB; 0 = unlimited")
+		gib := fl.Int64("max-gib", 0, "quota on unique CAS bytes, GiB, evicting LRU units to fit; 0 = unlimited")
 		fl.Parse(args)
 		if fl.NArg() != 1 {
 			log.Fatal("import: need exactly one source directory")
@@ -71,6 +82,8 @@ func main() {
 		sub := fl.String("subsystem", "", "only this subsystem")
 		fl.Parse(args)
 		err = units(*data, *sub)
+	case "gc", "evict", "refault", "audit", "pin":
+		err = gcCommand(cmd, fl, data, args)
 	default:
 		usage()
 	}
@@ -117,6 +130,9 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 	if err := registerSubsystems(context.Background(), mgr, dir); err != nil {
 		return err
 	}
+	if err := startGC(db, store, mgr, quota, max); err != nil {
+		return err
+	}
 	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr}
 	errc := make(chan error, 2)
 	if addrL != "" {
@@ -160,6 +176,10 @@ func importDir(dir, key, src string, quota int64) error {
 		return err
 	}
 	defer db.Close()
+	// With a quota, a full CAS evicts least recently used units first.
+	if _, err := gc.New(context.Background(), db, store, gc.Config{Logf: log.Printf}); err != nil {
+		return err
+	}
 	before, _ := store.Usage()
 	start := time.Now()
 	res, err := ingest.ImportDir(context.Background(), db, store, "local", key, src)

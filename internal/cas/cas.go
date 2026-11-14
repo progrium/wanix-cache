@@ -7,7 +7,9 @@
 // schema blob per save); calls take a context; Open returns an io.ReaderAt
 // that reports a short read at EOF as io.EOF.
 //
-// The quota counts unique blob bytes. There is no delete or GC yet.
+// The quota counts unique blob bytes. Blobs are deleted only through
+// Remove, which the GC sweeper calls; see Session for how ingest keeps the
+// blobs it is using safe from a concurrent sweep.
 package cas
 
 import (
@@ -20,7 +22,6 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
-	"time"
 
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
@@ -32,13 +33,26 @@ import (
 var ErrFull = syscall.ENOSPC
 
 // Store is a quota-limited Perkeep blob store.
-type Store struct{ q *quotaStore }
+type Store struct {
+	q *quotaStore
+
+	// holds and deleting close the race between ingest and the sweeper:
+	// an ingest that dedups against a blob the DB says is unreferenced must
+	// not have that blob deleted under it before it commits its reference.
+	// Sessions hold every blob they stat or write; Remove skips held blobs
+	// and marks the ones it deletes so new holds wait for the delete.
+	hmu      sync.Mutex
+	hcond    *sync.Cond
+	holds    map[blob.Ref]int
+	deleting map[blob.Ref]bool
+}
 
 type quotaStore struct {
 	blobserver.Storage
-	mu   sync.Mutex
-	used int64
-	max  int64
+	mu      sync.Mutex
+	used    int64
+	max     int64
+	reclaim func(ctx context.Context, need int64) (int64, error)
 }
 
 // Open opens or creates a store under dir/blobs. maxBytes 0 means no quota.
@@ -59,7 +73,20 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{q: q}, nil
+	st := &Store{q: q, holds: map[blob.Ref]int{}, deleting: map[blob.Ref]bool{}}
+	st.hcond = sync.NewCond(&st.hmu)
+	return st, nil
+}
+
+// SetReclaimer installs a function that frees space when a new blob would
+// exceed the quota. It is called without the store's locks held, and the
+// write fails with ErrFull only if the blob still does not fit afterwards.
+// The reclaimer must not wait on an open transaction of the caller's, so
+// ingest writes blobs before it opens the transaction that references them.
+func (s *Store) SetReclaimer(fn func(ctx context.Context, need int64) (freed int64, err error)) {
+	s.q.mu.Lock()
+	s.q.reclaim = fn
+	s.q.mu.Unlock()
 }
 
 // Usage returns unique blob bytes stored and the quota.
@@ -69,13 +96,13 @@ func (s *Store) Usage() (used, max int64) {
 	return s.q.used, s.q.max
 }
 
-// Put chunks r into the store and returns the file schema ref.
+// Put chunks r into the store and returns the file schema ref. It holds
+// nothing: callers that record the ref in the metadata DB while a GC sweep
+// may run use a Session instead.
 func (s *Store) Put(ctx context.Context, r io.Reader) (string, error) {
-	ref, err := schema.WriteFileFromReaderWithModTime(ctx, s.q, "", time.Time{}, r)
-	if err != nil {
-		return "", err
-	}
-	return ref.String(), nil
+	sess := s.Session()
+	defer sess.Close()
+	return sess.Put(ctx, r)
 }
 
 // File is an open CAS object.
@@ -109,7 +136,9 @@ func (f eofFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
-// ReceiveBlob enforces the quota. A blob that already exists is free.
+// ReceiveBlob enforces the quota. A blob that already exists is free. When
+// a new blob does not fit, the reclaimer (if any) is asked for the space
+// first, so a write fails only when nothing evictable remains.
 //
 // TODO(phase 3): the mutex is held across stat and write, which serializes
 // all ingest. Reserve quota under the lock and write outside it.
@@ -129,6 +158,19 @@ func (q *quotaStore) ReceiveBlob(ctx context.Context, br blob.Ref, r io.Reader) 
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return blob.SizedRef{}, err
+	}
+	if q.max > 0 && q.used+int64(len(data)) > q.max && q.reclaim != nil {
+		need, reclaim := q.used+int64(len(data))-q.max, q.reclaim
+		q.mu.Unlock()
+		_, rerr := reclaim(ctx, need)
+		q.mu.Lock()
+		if rerr != nil && !errors.Is(rerr, ErrFull) {
+			return blob.SizedRef{}, rerr
+		}
+		// Another writer may have stored the blob while unlocked.
+		if old, err := blobserver.StatBlob(ctx, q.Storage, br); err == nil {
+			return old, nil
+		}
 	}
 	if q.max > 0 && q.used+int64(len(data)) > q.max {
 		return blob.SizedRef{}, ErrFull

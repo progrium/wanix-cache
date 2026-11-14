@@ -21,7 +21,8 @@ the debug savings mode, and the subsystems come in later phases.
 | `internal/ingest` | Imports a local directory as a unit (stand-in for subsystem fetchers) |
 | `internal/subsys` | The `Subsystem` interface each subsystem implements, and the conventions below |
 | `internal/fill` | The fill-path API: unit manager, spool, quota, reclaimer hook (implementation in progress) |
-| `cmd/wanix-cache` | `serve`, `import`, `stats`, `units` |
+| `internal/gc` | Eviction and blob GC: global refcounts, LRU with watermarks, pins, sweep, audit |
+| `cmd/wanix-cache` | `serve`, `import`, `stats`, `units`, `gc`, `evict`, `refault`, `audit`, `pin` |
 
 ## Try it
 
@@ -49,6 +50,39 @@ Imported trees appear at `/local/<key>`.
 - **Symlinks** are stored for every subsystem. 9P2000.L serves them; plain
   9P2000 has no way to, so that server hides them.
 - **Read-only.** All client writes fail with EROFS. Only the cache writes.
+
+## Eviction and GC
+
+- **Two refcounts, both global.** `content.refs` counts file inodes of
+  resident units per content object; `gc_blob.refs` counts content objects
+  per CAS blob. Neither has a subsystem column, so a blob shared by an apk
+  and an OCI layer is freed only after the last reference anywhere goes.
+- **Evict** moves a unit `resident -> evicted`, clears its file inodes'
+  content refs (the manifest stays), and drops refcounts. Blobs left at zero
+  are doomed; a **sweep** deletes them through the blobserver
+  (`RemoveBlobs`; Perkeep has no GC of its own). The next read refaults the
+  unit into the same inodes.
+- **Policy.** One cap with high and low watermarks (default 95% and 85%).
+  Victims are the least recently used resident units that are not pinned,
+  except that units which would free nothing (all shared) wait until no
+  unit that frees bytes is left. Subsystems can veto an eviction
+  (`subsys.Evicter`) or order it (`EvictionOrderer`, e.g. Nix referrers
+  first).
+- **Evict before admit.** `fill.LocalQuota` and the CAS quota both call the
+  collector when a write does not fit, so a write fails with ENOSPC only
+  when nothing evictable remains.
+- **Pins.** In-memory pins from the fill manager (fills, open handles,
+  views), `Collector.Acquire`, and durable pins in `gc_pin` (package
+  indexes): `wanix-cache pin -key K -reason R`.
+- **Ingest contract.** Put blobs through a `cas.Session`, record
+  `RefContent` in the transaction that makes the unit resident, and close
+  the session after commit. The session holds every blob it wrote or found,
+  so a sweep cannot delete a doomed chunk that new content just deduped
+  against. The GC discovers new content rows itself and counts their blobs
+  (backfill), so ingest never calls into it.
+- **Audit** (`wanix-cache audit [-fix] [-deep]`) recomputes both refcounts,
+  compares them with the blobs on disk, deletes orphans, and evicts units
+  whose blobs are missing so they refetch.
 
 ## Subsystem conventions
 
