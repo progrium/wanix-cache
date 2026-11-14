@@ -199,3 +199,37 @@ func TestDotLReaddirPaging(t *testing.T) {
 		t.Fatalf("readdir at offset 1234: %v, %v", ents, err)
 	}
 }
+
+func TestDotLHidesWhiteouts(t *testing.T) {
+	ctx := context.Background()
+	db, _, root := setupL(t)
+	tx, _ := db.Begin(ctx)
+	d, _ := tx.MkdirAll("/layer")
+	now := time.Now()
+	// More whiteouts than one readdir page, then one real file.
+	for i := 0; i < 1500; i++ {
+		if _, err := tx.Whiteout(d, fmt.Sprintf("a-%04d", i), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.File(d, "z-real", 0o644, 0, now, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := root.Walk([]string{"layer", "a-0001"}); err == nil {
+		t.Error("walk to a whiteout succeeded")
+	}
+	dir := walk(t, root, "/layer")
+	if _, _, err := dir.Open(p9.ReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := dir.Readdir(0, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].Name != "z-real" {
+		t.Fatalf("listing = %v", ents)
+	}
+}
