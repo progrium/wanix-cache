@@ -402,6 +402,8 @@ func (s *Subsystem) upstreamNAR(ctx context.Context, ni *NarInfo) (io.ReadCloser
 // in first if needed.
 func (s *Subsystem) localNAR(ctx context.Context, ni *NarInfo) (io.ReadCloser, error) {
 	m := s.manager()
+	// The closure reads its members' files for itself, not for a client.
+	ctx = fill.Internal(ctx)
 	u, err := m.Ensure(ctx, Name, subsys.Key(ni.StorePath), true)
 	if err != nil {
 		return nil, err
@@ -685,6 +687,12 @@ func (s *Subsystem) Closure(ctx context.Context, sp StorePath) ([]StorePath, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
+}
+
+// DerivedUnit implements usage.Derived: a closure is built from its member
+// units, so filling it is not an upstream fetch.
+func (s *Subsystem) DerivedUnit(key subsys.Key) bool {
+	return strings.HasPrefix(string(key), closurePrefix)
 }
 
 // OnEvict implements subsys.Evicter.

@@ -25,6 +25,7 @@ import (
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/subsys"
+	"github.com/progrium/wanix-cache/internal/usage"
 )
 
 func TestBase32(t *testing.T) {
@@ -596,3 +597,5 @@ func TestBinaryCache(t *testing.T) {
 		t.Errorf("bogus: %d", code)
 	}
 }
+
+var _ usage.Derived = (*Subsystem)(nil)
