@@ -286,12 +286,15 @@ func (m *LocalManager) fill(s subsys.Subsystem, key subsys.Key, fk string, f *fl
 	defer m.wg.Done()
 	err := m.runFill(s, key, f)
 	f.err = err
+	// Close done before broadcasting, under the lock: waiters check done
+	// under m.mu before they Wait, so a broadcast that precedes the close
+	// would be lost and leave them waiting forever.
 	m.mu.Lock()
 	delete(m.flights, fk)
-	m.changed.Broadcast()
-	m.mu.Unlock()
 	f.start()
 	close(f.done)
+	m.changed.Broadcast()
+	m.mu.Unlock()
 }
 
 func (m *LocalManager) runFill(s subsys.Subsystem, key subsys.Key, f *flight) (err error) {
@@ -592,6 +595,9 @@ func (m *LocalManager) Miss(ctx context.Context, dir, name string) (bool, error)
 		return false, nil
 	}
 	key, _, err := s.Resolve(ctx, rel)
+	if errors.Is(err, subsys.ErrDir) {
+		return true, m.mkdirs(ctx, "/"+rest)
+	}
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
@@ -636,6 +642,26 @@ func (m *LocalManager) Miss(ctx context.Context, dir, name string) (bool, error)
 		}
 		m.changed.Wait()
 	}
+}
+
+// mkdirs creates the scaffolding directories of absolute path p, for
+// Resolve's ErrDir.
+func (m *LocalManager) mkdirs(ctx context.Context, p string) error {
+	tx, err := m.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.MkdirAll(p); err != nil {
+		tx.Rollback()
+		if errors.Is(err, meta.ErrExist) {
+			return nil // a concurrent miss made it
+		}
+		return err
+	}
+	if err := tx.Commit(); err != nil && !strings.Contains(err.Error(), "UNIQUE") {
+		return err
+	}
+	return nil
 }
 
 // exists reports whether an absolute path resolves in the namespace.

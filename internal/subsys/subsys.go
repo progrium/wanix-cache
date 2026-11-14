@@ -26,12 +26,19 @@ package subsys
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"time"
 
 	"github.com/progrium/wanix-cache/internal/meta"
 )
+
+// ErrDir is returned by Resolve for a path that is not inside any unit but
+// is a directory above unit mounts, such as /apk/x86_64 before any package
+// is mounted under it. The manager creates the directory so a walk through
+// it can reach the units below.
+var ErrDir = errors.New("subsys: directory above unit mounts")
 
 // Key identifies a unit within its subsystem.
 type Key string
@@ -67,7 +74,7 @@ type Subsystem interface {
 	// Resolve maps a path under /<name>/ (without that prefix, slash
 	// separated, no leading slash) to the unit that holds it and the path
 	// inside that unit. It returns fs.ErrNotExist for names that are not
-	// cache content.
+	// cache content, and ErrDir for directories above unit mounts.
 	Resolve(ctx context.Context, p string) (key Key, rel string, err error)
 	// Describe returns what is known about a unit without fetching it.
 	Describe(ctx context.Context, key Key) (Info, error)
