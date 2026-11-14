@@ -257,3 +257,8 @@ func (d *DB) Nlink(ctx context.Context, ino uint64) (uint64, error) {
 	err := d.db.QueryRowContext(ctx, `SELECT count(*) FROM dirent WHERE ino = ?`, ino).Scan(&n)
 	return n, err
 }
+
+// SQL returns the underlying database handle, for subsystem-owned tables
+// (<name>_<table>) and their queries. Subsystems must not write the core
+// tables (inode, dirent, unit, content) through it.
+func (d *DB) SQL() *sql.DB { return d.db }
