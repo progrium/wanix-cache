@@ -525,6 +525,7 @@ func (c *Collector) evict(ctx context.Context, u meta.Unit) error {
 		}
 		return nil
 	})
+	c.db.Changed() // the content refs above, written outside a meta.Tx
 	if err != nil {
 		return err
 	}

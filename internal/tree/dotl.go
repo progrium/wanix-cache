@@ -25,7 +25,7 @@ var _ p9.Attacher = DotL{}
 
 // Attach implements p9.Attacher.
 func (d DotL) Attach() (p9.File, error) {
-	in, err := d.FS.Meta.Get(context.Background(), meta.RootIno)
+	in, err := d.FS.metaGet(context.Background(), meta.RootIno)
 	if err != nil {
 		return nil, errno(err)
 	}
@@ -178,7 +178,7 @@ func (n *lnode) GetAttr(req p9.AttrMask) (p9.QID, p9.AttrMask, p9.Attr, error) {
 	in := n.in
 	a := lattr(in)
 	if in.Kind != meta.KindDir && n.idx == nil && !isSynth(in.Ino) && req.NLink {
-		nl, err := n.fs.Meta.Nlink(context.Background(), in.Ino)
+		nl, err := n.fs.metaNlink(context.Background(), in.Ino)
 		if err != nil {
 			return p9.QID{}, p9.AttrMask{}, p9.Attr{}, linux.EIO
 		}
@@ -226,8 +226,10 @@ func (n *lnode) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 		n.file = f
 		n.mu.Unlock()
 	case n.in.Kind == meta.KindFile:
-		// Re-read: the walk may predate an ingest or a refault.
-		in, err := n.fs.Meta.Get(context.Background(), n.in.Ino)
+		// Re-read: the walk may predate an ingest or a refault. (The cache
+		// is dropped on every namespace commit; fill.Manager re-reads
+		// uncached before it opens.)
+		in, err := n.fs.metaGet(context.Background(), n.in.Ino)
 		if err != nil {
 			return p9.QID{}, 0, errno(err)
 		}

@@ -29,6 +29,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,9 @@ func main() {
 	par := flag.Int("j", 8, "concurrent readers, one 9P connection each")
 	cold := flag.Bool("cold", false, "sync and drop the kernel caches before reading")
 	minSize := flag.Int64("min-size", 0, "only read files of at least this many bytes")
+	maxSize := flag.Int64("max-size", 0, "only read files of at most this many bytes (0: no limit)")
+	passes := flag.Int("passes", 1, "read every file this many times, one result line per pass (the server and its caches stay up between passes)")
+	cpuprof := flag.String("cpuprofile", "", "write a CPU profile of the read phase to this file")
 	flag.Parse()
 	ctx := context.Background()
 
@@ -76,10 +80,10 @@ func main() {
 	for _, f := range files {
 		byIno[f.ino] = f
 	}
-	if *minSize > 0 {
+	if *minSize > 0 || *maxSize > 0 {
 		var big []file
 		for _, f := range files {
-			if f.size >= *minSize {
+			if f.size >= *minSize && (*maxSize == 0 || f.size <= *maxSize) {
 				big = append(big, f)
 			}
 		}
@@ -137,54 +141,65 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	work := make(chan file, 256)
-	var nbytes, nfiles atomic.Int64
-	var firstErr atomic.Value
-	var wg sync.WaitGroup
-	start := time.Now()
-	for range *par {
-		c, err := net.Dial("tcp", ln.Addr().String())
+	if *cpuprof != "" {
+		pf, err := os.Create(*cpuprof)
 		if err != nil {
 			log.Fatal(err)
 		}
-		cl, err := p9.NewClient(c, p9.WithMessageSize(bench.Msize))
-		if err != nil {
-			log.Fatal(err)
-		}
-		root, err := cl.Attach("")
-		if err != nil {
-			log.Fatal(err)
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer cl.Close()
-			buf := make([]byte, 128<<10)
-			for f := range work {
-				n, err := read(root, f.path, buf)
-				if err != nil {
-					firstErr.CompareAndSwap(nil, fmt.Errorf("%s: %w", f.path, err))
-					continue
-				}
-				nbytes.Add(n)
-				nfiles.Add(1)
+		pprof.StartCPUProfile(pf)
+		defer pprof.StopCPUProfile()
+	}
+	for pass := 1; pass <= *passes; pass++ {
+		work := make(chan file, 256)
+		var nbytes, nfiles atomic.Int64
+		var firstErr atomic.Value
+		var wg sync.WaitGroup
+		start := time.Now()
+		for range *par {
+			c, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				log.Fatal(err)
 			}
-		}()
+			cl, err := p9.NewClient(c, p9.WithMessageSize(bench.Msize))
+			if err != nil {
+				log.Fatal(err)
+			}
+			root, err := cl.Attach("")
+			if err != nil {
+				log.Fatal(err)
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer cl.Close()
+				buf := make([]byte, 128<<10)
+				for f := range work {
+					n, err := read(root, f.path, buf)
+					if err != nil {
+						firstErr.CompareAndSwap(nil, fmt.Errorf("%s: %w", f.path, err))
+						continue
+					}
+					nbytes.Add(n)
+					nfiles.Add(1)
+				}
+			}()
+		}
+		for _, f := range files {
+			work <- f
+		}
+		close(work)
+		wg.Wait()
+		el := time.Since(start).Seconds()
+		if e, ok := firstErr.Load().(error); ok && e != nil {
+			pprof.StopCPUProfile()
+			log.Fatal(e)
+		}
+		json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"pass": pass, "store": *store, "cas": *casDir, "j": *par, "cold": *cold, "min_size": *minSize, "max_size": *maxSize, "files": nfiles.Load(),
+			"bytes": nbytes.Load(), "seconds": el, "mib_s": float64(nbytes.Load()) / (1 << 20) / el,
+			"files_s": float64(nfiles.Load()) / el,
+		})
 	}
-	for _, f := range files {
-		work <- f
-	}
-	close(work)
-	wg.Wait()
-	el := time.Since(start).Seconds()
-	if e, ok := firstErr.Load().(error); ok && e != nil {
-		log.Fatal(e)
-	}
-	json.NewEncoder(os.Stdout).Encode(map[string]any{
-		"store": *store, "cas": *casDir, "j": *par, "cold": *cold, "min_size": *minSize, "files": nfiles.Load(),
-		"bytes": nbytes.Load(), "seconds": el, "mib_s": float64(nbytes.Load()) / (1 << 20) / el,
-		"files_s": float64(nfiles.Load()) / el,
-	})
 }
 
 type nopCloser struct{ *bytes.Reader }

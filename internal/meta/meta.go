@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -116,6 +117,10 @@ CREATE TABLE IF NOT EXISTS content (
 type DB struct {
 	db *sql.DB
 
+	// gen counts committed changes to the namespace (inodes and dirents),
+	// for readers that cache it. See Gen.
+	gen atomic.Uint64
+
 	getInode *sql.Stmt
 	lookup   *sql.Stmt
 }
@@ -127,6 +132,12 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Keep idle connections. database/sql keeps 2 by default, so with more
+	// concurrent readers (one per 9P request in flight) it closed and
+	// reopened connections all the time, and each new SQLite connection
+	// re-reads the schema and re-prepares its statements: most of the CPU
+	// of a walk.
+	sdb.SetMaxIdleConns(64)
 	if _, err := sdb.Exec(schemaSQL); err != nil {
 		sdb.Close()
 		return nil, fmt.Errorf("meta: schema: %w", err)
@@ -154,6 +165,21 @@ func Open(path string) (*DB, error) {
 }
 
 func (d *DB) Close() error { return d.db.Close() }
+
+// Gen returns the namespace generation. It goes up after every committed
+// transaction that changed an inode or a directory entry, and on Changed.
+// A reader that caches the namespace reads Gen before it queries, keeps
+// the result under that generation, and drops it once Gen moves on.
+//
+// It only sees this process's writes. Other processes that write the
+// metadata (wanix-cache import, gc) add units, which a cache that keeps
+// no negative lookups sees anyway, and clear content refs, which callers
+// that open files must re-read uncached (as fill.Manager does).
+func (d *DB) Gen() uint64 { return d.gen.Load() }
+
+// Changed bumps the namespace generation, for code that writes inodes or
+// dirents through SQL rather than through a Tx.
+func (d *DB) Changed() { d.gen.Add(1) }
 
 type scanner interface{ Scan(...any) error }
 

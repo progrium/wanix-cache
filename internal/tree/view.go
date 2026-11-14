@@ -85,7 +85,7 @@ func (f *FS) viewLookup(ctx context.Context, dir uint64, name string) (meta.Inod
 // get returns an inode, real or virtual.
 func (f *FS) get(ctx context.Context, ino uint64) (meta.Inode, error) {
 	if !subsys.IsVirtual(ino) {
-		return f.Meta.Get(ctx, ino)
+		return f.metaGet(ctx, ino)
 	}
 	v, ok := f.viewerOf(ino)
 	if !ok {

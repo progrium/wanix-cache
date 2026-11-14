@@ -233,3 +233,49 @@ func BenchmarkReadDir1k(b *testing.B) {
 		}
 	}
 }
+
+func TestGen(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	g := db.Gen()
+	tx, _ := db.Begin(ctx)
+	if _, err := tx.MkdirAll("/gone"); err != nil {
+		t.Fatal(err)
+	}
+	tx.Rollback()
+	if db.Gen() != g {
+		t.Fatal("rollback bumped the generation")
+	}
+	tx, _ = db.Begin(ctx)
+	if _, err := tx.CreateUnit("apk", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db.Gen() != g {
+		t.Fatal("a unit-only commit bumped the generation")
+	}
+	tx, _ = db.Begin(ctx)
+	ino, err := tx.File(RootIno, "f", 0o644, 1, time.Now(), "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db.Gen() == g {
+		t.Fatal("creating a file did not bump the generation")
+	}
+	g = db.Gen()
+	tx, _ = db.Begin(ctx)
+	if err := tx.SetContent(ino, "sha224-x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db.Gen() == g {
+		t.Fatal("SetContent did not bump the generation")
+	}
+}

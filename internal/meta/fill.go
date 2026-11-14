@@ -91,24 +91,24 @@ func (t *Tx) Lookup(parent uint64, name string) (Inode, error) {
 // UpdateFile sets a file inode's mode, size and mtime, for a refault that
 // reuses an inode from the kept manifest or a file whose size became known.
 func (t *Tx) UpdateFile(ino uint64, mode uint32, size int64, mtime time.Time) error {
-	_, err := t.tx.ExecContext(t.ctx, `UPDATE inode SET mode = ?, size = ?, mtime = ? WHERE ino = ?`, mode, size, mtime.UnixNano(), ino)
+	_, err := t.exec(`UPDATE inode SET mode = ?, size = ?, mtime = ? WHERE ino = ?`, mode, size, mtime.UnixNano(), ino)
 	return err
 }
 
 // SetContent sets a file inode's CAS ref ("" while its bytes are only in
 // the spool or evicted).
 func (t *Tx) SetContent(ino uint64, ref string) error {
-	_, err := t.tx.ExecContext(t.ctx, `UPDATE inode SET content = ? WHERE ino = ?`, ref, ino)
+	_, err := t.exec(`UPDATE inode SET content = ? WHERE ino = ?`, ref, ino)
 	return err
 }
 
 // DeleteUnitTree removes every inode a unit owns and every dirent naming
 // them, for a first fill that failed. It does not touch content refcounts.
 func (t *Tx) DeleteUnitTree(unit int64) error {
-	if _, err := t.tx.ExecContext(t.ctx, `DELETE FROM dirent WHERE ino IN (SELECT ino FROM inode WHERE unit = ?)`, unit); err != nil {
+	if _, err := t.exec(`DELETE FROM dirent WHERE ino IN (SELECT ino FROM inode WHERE unit = ?)`, unit); err != nil {
 		return err
 	}
-	_, err := t.tx.ExecContext(t.ctx, `DELETE FROM inode WHERE unit = ?`, unit)
+	_, err := t.exec(`DELETE FROM inode WHERE unit = ?`, unit)
 	return err
 }
 
@@ -130,9 +130,9 @@ func (t *Tx) ReplaceEmptyDir(parent uint64, name string) error {
 	if n != 0 {
 		return fmt.Errorf("meta: %q is not empty", name)
 	}
-	if _, err := t.tx.ExecContext(t.ctx, `DELETE FROM dirent WHERE parent = ? AND name = ?`, parent, name); err != nil {
+	if _, err := t.exec(`DELETE FROM dirent WHERE parent = ? AND name = ?`, parent, name); err != nil {
 		return err
 	}
-	_, err = t.tx.ExecContext(t.ctx, `DELETE FROM inode WHERE ino = ?`, in.Ino)
+	_, err = t.exec(`DELETE FROM inode WHERE ino = ?`, in.Ino)
 	return err
 }

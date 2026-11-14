@@ -59,6 +59,14 @@ Attach to one as a root by giving its path as the attach name
 - **Symlinks** are stored for every subsystem. 9P2000.L serves them; plain
   9P2000 has no way to, so that server hides them.
 - **Read-only.** All client writes fail with EROFS. Only the cache writes.
+- **Namespace cache.** The 9P servers keep lookups, inodes and link counts in
+  memory (`internal/tree/cache.go`), so a walk to a path seen before makes no
+  SQLite query. `meta.DB.Gen` goes up on every commit that touches inodes or
+  dirents, and the whole cache is dropped when it does. Misses are not
+  cached, so a name that appears later is found (and faulted in) as before.
+  The metadata DB also keeps up to 64 idle SQLite connections: with the
+  database/sql default of 2, concurrent 9P requests reopened a connection on
+  most queries, re-reading the schema each time.
 
 ## Eviction and GC
 

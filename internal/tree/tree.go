@@ -41,6 +41,7 @@ type FS struct {
 	Index *h9index.Store
 
 	views viewSet // see view.go
+	cache nsCache // see cache.go
 
 	// Synthetic, if set, are read-only files in /.cache (SyntheticDir)
 	// whose bytes are generated when they are looked up, such as
@@ -57,7 +58,7 @@ func (f *FS) lookup(ctx context.Context, dir uint64, name string) (meta.Inode, e
 	if in, ok, err := f.viewLookup(ctx, dir, name); ok {
 		return in, err
 	}
-	in, err := f.Meta.Lookup(ctx, dir, name)
+	in, err := f.metaLookup(ctx, dir, name)
 	if err == nil || f.Faults == nil || !errors.Is(err, meta.ErrNotExist) {
 		return in, err
 	}
@@ -72,7 +73,7 @@ func (f *FS) lookup(ctx context.Context, dir uint64, name string) (meta.Inode, e
 	if !retry {
 		return in, err
 	}
-	return f.Meta.Lookup(ctx, dir, name)
+	return f.metaLookup(ctx, dir, name)
 }
 
 // open returns a file inode's bytes.
@@ -103,7 +104,7 @@ func node(in meta.Inode) ninep.Node {
 func visible(in meta.Inode) bool { return in.Kind == meta.KindDir || in.Kind == meta.KindFile }
 
 func (f *FS) Root(ctx context.Context) (ninep.Node, error) {
-	in, err := f.Meta.Get(ctx, meta.RootIno)
+	in, err := f.metaGet(ctx, meta.RootIno)
 	return node(in), err
 }
 
@@ -223,7 +224,7 @@ func (f *FS) Open(ctx context.Context, n ninep.Node) (ninep.File, error) {
 	if isSynth(n.Ino) {
 		return f.synthOpen(ctx, n.Ino)
 	}
-	in, err := f.Meta.Get(ctx, n.Ino)
+	in, err := f.metaGet(ctx, n.Ino)
 	if err != nil {
 		return nil, err
 	}

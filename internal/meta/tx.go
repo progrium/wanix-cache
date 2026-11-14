@@ -14,7 +14,9 @@ import (
 // Tx is a write transaction. A unit's whole manifest is normally written in
 // one Tx, so it appears in the namespace atomically.
 type Tx struct {
+	db   *DB
 	tx   *sql.Tx
+	ns   bool // wrote inodes or dirents: bump db.gen on commit
 	ctx  context.Context
 	dirs map[string]uint64 // MkdirAll cache, by cleaned path
 
@@ -28,7 +30,7 @@ func (d *DB) Begin(ctx context.Context) (*Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Tx{tx: tx, ctx: ctx, dirs: map[string]uint64{"/": RootIno}}
+	t := &Tx{db: d, tx: tx, ctx: ctx, dirs: map[string]uint64{"/": RootIno}}
 	if t.insInode, err = tx.PrepareContext(ctx, `INSERT INTO inode (kind, mode, size, mtime, content, target, parent, unit) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`); err != nil {
 		tx.Rollback()
 		return nil, err
@@ -40,8 +42,22 @@ func (d *DB) Begin(ctx context.Context) (*Tx, error) {
 	return t, nil
 }
 
-func (t *Tx) Commit() error   { return t.tx.Commit() }
+func (t *Tx) Commit() error {
+	err := t.tx.Commit()
+	if t.ns {
+		// Even after a failed commit: whether it landed is not certain.
+		t.db.Changed()
+	}
+	return err
+}
+
 func (t *Tx) Rollback() error { return t.tx.Rollback() }
+
+// exec runs a statement that writes inodes or dirents.
+func (t *Tx) exec(q string, args ...any) (sql.Result, error) {
+	t.ns = true
+	return t.tx.ExecContext(t.ctx, q, args...)
+}
 
 func validName(name string) error {
 	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') {
@@ -71,6 +87,7 @@ func (t *Tx) create(parent uint64, name string, in Inode) (uint64, error) {
 	if in.Kind == KindDir {
 		in.Parent = parent
 	}
+	t.ns = true
 	res, err := t.insInode.ExecContext(t.ctx, in.Kind, uint32(in.Mode.Perm()), in.Size, in.Mtime.UnixNano(), in.Content, in.Target, in.Parent, in.Unit)
 	if err != nil {
 		return 0, err
@@ -86,6 +103,7 @@ func (t *Tx) create(parent uint64, name string, in Inode) (uint64, error) {
 }
 
 func (t *Tx) link(parent uint64, name string, ino uint64) error {
+	t.ns = true
 	if _, err := t.insDirent.ExecContext(t.ctx, parent, name, ino); err != nil {
 		if isUnique(err) {
 			return fmt.Errorf("meta: %q: %w", name, ErrExist)
@@ -196,6 +214,6 @@ func (t *Tx) Whiteout(parent uint64, name string, unit int64) (uint64, error) {
 
 // SetFlags replaces an inode's flags, for example FlagOpaque on a directory.
 func (t *Tx) SetFlags(ino uint64, flags uint32) error {
-	_, err := t.tx.ExecContext(t.ctx, `UPDATE inode SET flags = ? WHERE ino = ?`, flags, ino)
+	_, err := t.exec(`UPDATE inode SET flags = ? WHERE ino = ?`, flags, ino)
 	return err
 }
