@@ -6,6 +6,10 @@ import (
 	"crypto/rand"
 	"io"
 	"testing"
+
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
+	"time"
 )
 
 func TestPutDeterministicAndDeduped(t *testing.T) {
@@ -140,5 +144,38 @@ func TestReclaimerBeforeFull(t *testing.T) {
 	}
 	if asked == 0 {
 		t.Fatal("reclaimer not asked")
+	}
+}
+
+// TestCancelledStatsDoNotWedge reproduces the Perkeep stat-gate leak: a
+// stat with an already-cancelled context takes a slot of the process-wide
+// gate and never returns it, so after 20 of them every stat blocks.
+func TestCancelledStatsDoNotWedge(t *testing.T) {
+	s, err := Open(t.TempDir(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := s.Put(context.Background(), bytes.NewReader([]byte("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	br, _ := blob.Parse(ref)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 50; i++ {
+		blobserver.StatBlob(cancelled, s.q, br)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := blobserver.StatBlob(context.Background(), s.q, br)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stat blocked: stat gate exhausted")
 	}
 }

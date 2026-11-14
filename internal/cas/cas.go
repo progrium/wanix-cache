@@ -181,3 +181,15 @@ func (q *quotaStore) ReceiveBlob(ctx context.Context, br blob.Ref, r io.Reader) 
 	}
 	return got, err
 }
+
+// statNoCancel works around a Perkeep bug: localdisk's StatBlobs shares one
+// process-wide gate of 20 slots, and blobserver.StatBlobsParallelHelper
+// leaks a slot whenever its context is cancelled between taking the slot and
+// starting the stat. Enough cancelled stats (for example fills or ingests
+// cut short by shutdown) exhaust the gate and every later stat in the
+// process blocks forever. Stats are local and fast, so they run uncancelled.
+type statNoCancel struct{ blobserver.Storage }
+
+func (s statNoCancel) StatBlobs(ctx context.Context, blobs []blob.Ref, fn func(blob.SizedRef) error) error {
+	return s.Storage.StatBlobs(context.WithoutCancel(ctx), blobs, fn)
+}

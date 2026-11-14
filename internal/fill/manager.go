@@ -486,9 +486,26 @@ func (m *LocalManager) OpenPath(ctx context.Context, sub string, key subsys.Key,
 }
 
 func (m *LocalManager) open(ctx context.Context, in meta.Inode) (cas.File, error) {
+	// Re-read first: the caller's inode may predate an ingest or an
+	// eviction, and eviction may race with the pin taken by Open.
+	if fresh, err := m.db.Get(ctx, in.Ino); err == nil {
+		in = fresh
+	}
 	for attempt := 0; attempt < 4; attempt++ {
 		if in.Content != "" {
-			return m.store.Open(ctx, in.Content)
+			f, err := m.store.Open(ctx, in.Content)
+			if err == nil {
+				return f, nil
+			}
+			// A blob can vanish if eviction committed between our pin and
+			// this open. If the inode no longer has that ref, treat it as a
+			// refault and go round again; otherwise it is a real error.
+			fresh, gerr := m.db.Get(ctx, in.Ino)
+			if gerr != nil || fresh.Content == in.Content {
+				return nil, err
+			}
+			in = fresh
+			continue
 		}
 		if f, err := m.spool.Open(in.Ino); err == nil {
 			return f, nil
@@ -741,8 +758,9 @@ func (m *LocalManager) ingestLoop() {
 }
 
 // ingestUnit chunks a spooled unit's files into the CAS, with up to
-// Options.Workers files in flight, then marks it resident and drops its
-// spool.
+// Options.Workers files in flight, then records every content ref and moves
+// the unit to resident in one transaction, and drops its spool. No write
+// transaction is held across CAS puts.
 func (m *LocalManager) ingestUnit(id int64) error {
 	ctx := m.ctx
 	u, err := m.db.UnitByID(ctx, id)
@@ -753,9 +771,17 @@ func (m *LocalManager) ingestUnit(id int64) error {
 	if err != nil {
 		return err
 	}
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
+	type result struct {
+		ino         uint64
+		digest, ref string
+		size        int64
+	}
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		results  []result
+		firstErr error
+	)
 	for _, in := range files {
 		if in.Content != "" || in.Size == 0 {
 			continue
@@ -765,13 +791,16 @@ func (m *LocalManager) ingestUnit(id int64) error {
 		wg.Add(1)
 		go func() {
 			defer func() { <-m.sem; wg.Done() }()
-			if err := m.ingestFile(ctx, in); err != nil {
-				mu.Lock()
+			digest, ref, err := m.ingestFile(ctx, in)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("inode %d: %w", in.Ino, err)
 				}
-				mu.Unlock()
+				return
 			}
+			results = append(results, result{in.Ino, digest, ref, in.Size})
 		}()
 	}
 	wg.Wait()
@@ -782,7 +811,18 @@ func (m *LocalManager) ingestUnit(id int64) error {
 	if err != nil {
 		return err
 	}
-	if err := tx.SetUnitState(id, meta.UnitSpooled, meta.UnitResident); err != nil {
+	for _, r := range results {
+		if err = tx.RefContent(r.digest, r.ref, r.size); err == nil {
+			err = tx.SetContent(r.ino, r.ref)
+		}
+		if err != nil {
+			break
+		}
+	}
+	if err == nil {
+		err = tx.SetUnitState(id, meta.UnitSpooled, meta.UnitResident)
+	}
+	if err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -797,38 +837,29 @@ func (m *LocalManager) ingestUnit(id int64) error {
 	return nil
 }
 
-func (m *LocalManager) ingestFile(ctx context.Context, in meta.Inode) error {
+// ingestFile stores one spool file in the CAS, skipping the chunker when
+// its whole-file digest is already known.
+func (m *LocalManager) ingestFile(ctx context.Context, in meta.Inode) (digest, ref string, err error) {
 	f, err := m.spool.Open(in.Ino)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, io.NewSectionReader(f, 0, in.Size)); err != nil {
-		return err
+		return "", "", err
 	}
-	digest := "sha256-" + hex.EncodeToString(h.Sum(nil))
+	digest = "sha256-" + hex.EncodeToString(h.Sum(nil))
 	ref, ok, err := m.db.ContentRef(ctx, digest)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	if !ok {
 		if ref, err = m.store.Put(ctx, io.NewSectionReader(f, 0, in.Size)); err != nil {
-			return err
+			return "", "", err
 		}
 	}
-	tx, err := m.db.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	if err := tx.RefContent(digest, ref, in.Size); err == nil {
-		err = tx.SetContent(in.Ino, ref)
-	}
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	return digest, ref, nil
 }
 
 // fillSink writes a fetch into the namespace and the spool.
