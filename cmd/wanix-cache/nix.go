@@ -27,7 +27,7 @@ func addNixFlags(fl *flag.FlagSet) {
 }
 
 func registerNix(ctx context.Context, m *fill.LocalManager) error {
-	opts := nix.Options{Substituters: strings.Fields(nixFlags.substituters)}
+	opts := nix.Options{Substituters: strings.Fields(nixFlags.substituters), Indexer: rootIndexer, Logf: log.Printf}
 	if nixFlags.evict {
 		opts.OnEvict = nix.NixStoreDelete("", nixFlags.evictStore)
 	}

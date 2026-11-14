@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
@@ -413,8 +414,21 @@ func TestBadAndMissing(t *testing.T) {
 	}
 }
 
+type fakeIndexer struct {
+	mu    sync.Mutex
+	roots []string
+}
+
+func (f *fakeIndexer) IndexRoot(_ context.Context, root string) error {
+	f.mu.Lock()
+	f.roots = append(f.roots, root)
+	f.mu.Unlock()
+	return nil
+}
+
 func TestClosure(t *testing.T) {
-	e := newEnv(t, Options{})
+	idx := &fakeIndexer{}
+	e := newEnv(t, Options{Indexer: idx})
 	ctx := e.ctx
 	got, err := e.nix.Closure(ctx, appPath)
 	if err != nil {
@@ -454,6 +468,20 @@ func TestClosure(t *testing.T) {
 	u, _ := e.db.Unit(ctx, Name, string(key))
 	if p, _ := e.db.PathOf(ctx, u.Root); p != "/nix/closure/"+string(appPath) {
 		t.Errorf("closure mounted at %s", p)
+	}
+	for i := 0; i < 100; i++ {
+		idx.mu.Lock()
+		n := len(idx.roots)
+		idx.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if len(idx.roots) != 1 || idx.roots[0] != "/nix/closure/"+string(appPath) {
+		t.Errorf("indexed roots = %v, want the closure once", idx.roots)
 	}
 }
 

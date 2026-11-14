@@ -16,6 +16,7 @@ import (
 
 	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
+	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
@@ -42,7 +43,12 @@ func TestUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, _ := New(db, Options{})
+	idx, err := h9index.Open(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tfs := &tree.FS{Meta: db, CAS: store, Files: m, Faults: m, Index: idx}
+	n, _ := New(db, Options{Indexer: tfs.Indexer(idx, ""), Logf: t.Logf})
 	if err := m.Register(ctx, n); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +56,7 @@ func TestUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	go tree.NewDotLServer(&tree.FS{Meta: db, CAS: store, Files: m, Faults: m}).Serve(ln)
+	go tree.NewDotLServer(tfs).Serve(ln)
 	bc := httptest.NewServer(&BinaryCache{Nix: n, Logf: t.Logf})
 	t.Cleanup(func() { bc.Close(); ln.Close(); m.Close(); db.Close() })
 
@@ -93,6 +99,20 @@ func TestUpstream(t *testing.T) {
 	start = time.Now()
 	libc := read("/nix/closure/" + string(hello) + "/nix/store/1q857rs68rs3gijls9wdnsjqnwnv5zd8-glibc-2.44-57/lib/libc.so.6")
 	t.Logf("closure root read of libc.so.6: %d bytes in %v", len(libc), time.Since(start))
+
+	var index []byte
+	for i := 0; i < 50 && len(index) == 0; i++ {
+		if _, f, err := root.Walk([]string{"nix", "closure", string(hello), ".h9index"}); err == nil {
+			f.Close()
+			index = read("/nix/closure/" + string(hello) + "/.h9index")
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if len(index) == 0 {
+		t.Fatal("closure root has no /.h9index")
+	}
+	t.Logf("closure /.h9index: %d bytes", len(index))
 
 	nixBin, err := exec.LookPath("nix")
 	if err != nil {

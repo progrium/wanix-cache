@@ -67,6 +67,11 @@ type Options struct {
 	// NegativeTTL is how long a path no substituter has is remembered as
 	// missing. Default 10 minutes.
 	NegativeTTL time.Duration
+	// Indexer, if set, gets IndexRoot("/nix/closure/<path>") each time a
+	// closure's manifest completes, so H9 sees its /.h9index.
+	Indexer subsys.RootIndexer
+	// Logf receives background errors. Default: discarded.
+	Logf func(string, ...any)
 	// Now is the clock, for tests.
 	Now func() time.Time
 }
@@ -130,6 +135,9 @@ func (s *Subsystem) Attach(ctx context.Context, m fill.Manager) error {
 	s.mu.Lock()
 	s.mgr = m
 	s.mu.Unlock()
+	if s.opts.Indexer != nil {
+		m.Watch(s.indexClosure)
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return err
@@ -141,6 +149,20 @@ func (s *Subsystem) Attach(ctx context.Context, m fill.Manager) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// indexClosure indexes a closure root once its manifest is complete. Its
+// members were all filled (spooled or resident) before it, by Fetch.
+func (s *Subsystem) indexClosure(ev fill.UnitEvent) {
+	sp, ok := strings.CutPrefix(ev.Unit.Key, closurePrefix)
+	if ev.Unit.Subsystem != Name || !ok || ev.To != meta.UnitSpooled {
+		return
+	}
+	go func() {
+		if err := s.opts.Indexer.IndexRoot(context.Background(), "/nix/closure/"+sp); err != nil && s.opts.Logf != nil {
+			s.opts.Logf("nix: indexing closure %s: %v", sp, err)
+		}
+	}()
 }
 
 func (s *Subsystem) manager() fill.Manager {
