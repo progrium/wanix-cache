@@ -18,8 +18,7 @@ Unless an entry says otherwise, the setup is the same for all entries:
 
 ## 2026-11-14 · Plain files with hard links replace the CAS
 
-**Commit:** the one that adds this entry ("Replace the CAS with plain files
-and hard links")
+**Commit:** 64e0c60
 
 The Perkeep CAS is gone. Each stored file is a plain file under
 `DATA/files/<unit>/<inode>`, and identical files are hard-linked across
