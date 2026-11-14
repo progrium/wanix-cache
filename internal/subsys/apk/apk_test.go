@@ -100,6 +100,15 @@ func newHarness(t *testing.T, unpack bool) *harness {
 	h.mirror = httptest.NewServer(h.apk)
 	t.Cleanup(func() {
 		h.mirror.Close()
+		// Background unpacks and layer indexing log through t: let them
+		// finish before the test does. Unpacks can start more indexing, so
+		// wait for fills, then the subsystem, then fills again.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		mgr.Wait(ctx)
+		h.apk.Wait()
+		mgr.Wait(ctx)
+		h.apk.Wait()
 		upSrv.Close()
 		mgr.Close()
 		db.Close()

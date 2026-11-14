@@ -82,6 +82,7 @@ type APK struct {
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // per-repo index refresh
+	bg    sync.WaitGroup          // background indexing and unpacking
 	now   func() time.Time
 }
 
@@ -120,7 +121,7 @@ func (a *APK) indexLayer(ev fill.UnitEvent) {
 	if ev.Unit.Subsystem != Name || ev.To != meta.UnitSpooled || !a.DerivedUnit(subsys.Key(ev.Unit.Key)) {
 		return
 	}
-	go func() {
+	a.bg.Go(func() {
 		ctx := context.Background()
 		info, err := a.Describe(ctx, subsys.Key(ev.Unit.Key))
 		if err == nil {
@@ -129,8 +130,12 @@ func (a *APK) indexLayer(ev fill.UnitEvent) {
 		if err != nil {
 			a.cfg.Logf("apk: indexing layer %s: %v", ev.Unit.Key, err)
 		}
-	}()
+	})
 }
+
+// Wait blocks until background layer indexing and unpacking started so far
+// have finished, for tests and orderly shutdown.
+func (a *APK) Wait() { a.bg.Wait() }
 
 func (a *APK) Name() string { return Name }
 

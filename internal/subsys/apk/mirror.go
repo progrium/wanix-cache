@@ -94,13 +94,13 @@ func (a *APK) servePackage(w http.ResponseWriter, r *http.Request, repo, nv stri
 	}
 	defer f.Close()
 	if a.cfg.Unpack {
-		go func() {
+		a.bg.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 			if _, err := a.mgr.Ensure(ctx, Name, filesKey(pkg.SHA1), true); err != nil {
 				a.cfg.Logf("apk: unpack %s: %v", pkg.NV, err)
 			}
-		}()
+		})
 	}
 	w.Header().Set("ETag", `"`+pkg.SHA1+`"`)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
