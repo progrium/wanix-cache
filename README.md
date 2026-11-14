@@ -23,7 +23,8 @@ the debug savings mode, and the subsystems come in later phases.
 | `internal/subsys/apk` | Alpine packages: read-through HTTP mirror for in-guest apk, per-package overlay layers |
 | `internal/usage` | Usage stats per package, content object and path, kept across eviction; never-opened report |
 | `internal/subsys/oci` | OCI images: registry client with anonymous token auth, layer units, merged rootfs views |
-| `internal/fill` | The fill-path API: unit manager, spool, quota, reclaimer hook (implementation in progress) |
+| `internal/fill` | The fill path: unit manager, single-flight faults, spool, async ingest, crash recovery, quota, debug shadow tree |
+| `internal/savings` | Debug savings mode: disk vs CAS savings per subsystem (`/.cache/stats`, `wanix-cache stats`) |
 | `internal/h9index` | Generates, stores and serves each root's `/.h9index` (hyper9's mount-index) from metadata |
 | `internal/gc` | Eviction and blob GC: global refcounts, LRU with watermarks, pins, sweep, audit |
 | `cmd/wanix-cache` | `serve`, `import`, `index`, `stats`, `units`, `usage`, `gc`, `evict`, `refault`, `audit`, `pin` |
@@ -287,6 +288,54 @@ that path as a 9P root directly.
 
 `WANIX_OCI_LIVE=1 go test -run Live ./internal/subsys/oci` pulls
 alpine:3.20 from Docker Hub through the 9P2000.L server.
+
+## Savings (debug mode)
+
+`wanix-cache stats` and `/.cache/stats` report what the CAS saves, in
+total and per subsystem. Sizes are allocated blocks (st_blocks × 512).
+`stats -json` prints the same report as JSON, one result per run for the
+savings test plan.
+
+- **CAS total**: the blob store (blob files and localdisk's hash-prefix
+  directories) plus the metadata DB.
+- **Whole-file dedupe**: 1 − distinct content bytes ÷ logical bytes.
+  **Chunk dedupe**: 1 − unique chunk bytes ÷ distinct content bytes, which
+  is what chunking adds on top.
+- **Schema blobs**, **per-blob overhead** (blob files' allocated minus
+  logical bytes) and **store directories**, each as a share of CAS total,
+  plus slack by content size class (< 4, 16, 64 KiB), which tells you
+  whether small-file packing would pay.
+- **Exclusive and shared** blob bytes per subsystem, with the bytes shared
+  with each other subsystem. **Attributed** splits each shared blob evenly
+  between the subsystems that reach it.
+- **B2**, plain unpacked with no dedupe, needs the shadow tree:
+  `serve -debug-shadow` keeps every resident unit unpacked under
+  `DATA/shadow/<subsystem>/<unit id>`. Right after ingest the tree is
+  hard-linked from the unit's spool files, so it costs no copy; missing
+  trees are written from the CAS at startup and before each `/.cache/stats`.
+  Eviction removes a unit's tree. The shadow is **not** counted by
+  `-max-gib`, so leave headroom. **B3 (est.)** approximates the shadow with
+  identical files hard-linked. Running `rdfind`/`jdupes` over a copy of the
+  shadow gives the measured B3.
+- The 20 units with the most exclusive bytes and the 20 most-shared content
+  objects, which explain most surprises.
+
+W0 (the Go source tree as one local unit, ext4):
+
+| | |
+|---|---|
+| Logical | 126.3 MiB (12,054 files) |
+| B2, plain unpacked | 162.3 MiB |
+| CAS total | 289 to 297 MiB (store 281.2 MiB + DB 8 to 16 MiB with WAL) |
+| Whole-file / chunk dedupe | 1.2% / 0.1% |
+| Per-blob overhead | 74.8 MiB, 26% of CAS total (24,040 blob files) |
+| Store directories | 79.7 MiB, 27% of CAS total (20,410 directories) |
+| Slack from contents under 4 KiB | 68% of all slack |
+
+So on small-file trees, localdisk's layout costs more than half the CAS:
+one 4 KiB block per blob file (two per file) plus one per hash-prefix
+directory. That is the "per-blob overhead above 10%" row of the test plan's
+decision table, before the larger workloads have run.
 
 ## Measurements (phase 1)
 

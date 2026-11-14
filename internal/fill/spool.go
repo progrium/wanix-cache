@@ -246,6 +246,16 @@ func (s *DiskSpool) Release(unit int64) int64 {
 // Unrelease undoes Release.
 func (s *DiskSpool) Unrelease(unit, n int64) { s.count(unit, n) }
 
+// path returns a spool file's path while the spool knows it.
+func (s *DiskSpool) path(ino uint64) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f := s.files[ino]; f != nil {
+		return f.path, true
+	}
+	return "", false
+}
+
 // Remove implements Spool.
 func (s *DiskSpool) Remove(unit int64) error {
 	s.mu.Lock()

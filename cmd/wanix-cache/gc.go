@@ -17,7 +17,7 @@ import (
 
 // startGC attaches the eviction policy to a serving manager and runs the
 // watermark loop in the background.
-func startGC(db *meta.DB, store *cas.Store, mgr fill.Manager, quota *fill.LocalQuota, max int64) error {
+func startGC(db *meta.DB, store *cas.Store, mgr fill.Manager, quota *fill.LocalQuota, max int64, shadow string) error {
 	c, err := gc.New(context.Background(), db, store, gc.Config{
 		Max: max,
 		Usage: func() int64 {
@@ -25,6 +25,12 @@ func startGC(db *meta.DB, store *cas.Store, mgr fill.Manager, quota *fill.LocalQ
 			return u.CAS + u.Spool + u.Reserved
 		},
 		Logf: log.Printf,
+		// The debug shadow tree mirrors resident units only.
+		Notify: func(ev fill.UnitEvent) {
+			if err := fill.RemoveShadow(shadow, ev.Unit); err != nil {
+				log.Printf("shadow: %v", err)
+			}
+		},
 	})
 	if err != nil {
 		return err

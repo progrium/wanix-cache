@@ -1,9 +1,9 @@
 // Command wanix-cache is the H9 read-through cache.
 //
-//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR]
+//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR] [-debug-shadow]
 //	wanix-cache import [-data DIR] [-max-gib N] -key NAME SRC
 //	wanix-cache index  [-data DIR] [-all] [ROOT...]
-//	wanix-cache stats  [-data DIR]
+//	wanix-cache stats  [-data DIR] [-json] [-n N]
 //	wanix-cache units  [-data DIR] [-subsystem NAME]
 //	wanix-cache usage  [-data DIR] [-subsystem NAME] [-untouched] [-json]
 //	wanix-cache gc     [-data DIR] [-max-gib N] [-high F] [-low F]
@@ -14,7 +14,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -33,6 +35,7 @@ import (
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/savings"
 	"github.com/progrium/wanix-cache/internal/subsys"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
@@ -44,7 +47,7 @@ commands:
   serve    serve the cache read-only over 9P2000.L (and optionally plain 9P2000)
   import   import a local directory as a unit under /local/<key>
   index    generate the /.h9index of roots (such as /local/alpine)
-  stats    print store totals
+  stats    disk vs CAS savings, per subsystem (B2 needs serve -debug-shadow)
   units    list units
   usage    package, object and path usage; -untouched lists never-opened files
   gc       sweep unreferenced blobs and evict down to the low watermark
@@ -70,9 +73,10 @@ func main() {
 		addr := fl.String("9p2000", "", "plain 9P2000 TCP listen address (no symlinks); empty to disable")
 		gib := fl.Int64("max-gib", 10, "cap on CAS + spool bytes, GiB; 0 = unlimited")
 		workers := fl.Int("ingest-workers", 4, "files ingested into the CAS concurrently")
+		shadow := fl.Bool("debug-shadow", false, "debug savings mode: also keep every resident unit unpacked on plain disk under DATA/shadow, for /.cache/stats and `stats` (not counted by -max-gib)")
 		addSubsystemFlags(fl)
 		fl.Parse(args)
-		err = serve(*data, *addrL, *addr, *gib<<30, *workers)
+		err = serve(*data, *addrL, *addr, *gib<<30, *workers, *shadow)
 	case "import":
 		key := fl.String("key", "", "unit key (defaults to the source directory's name)")
 		gib := fl.Int64("max-gib", 0, "quota on unique CAS bytes, GiB, evicting LRU units to fit; 0 = unlimited")
@@ -89,8 +93,10 @@ func main() {
 		}
 		err = indexRoots(*data, *all, fl.Args())
 	case "stats":
+		asJSON := fl.Bool("json", false, "print JSON")
+		top := fl.Int("n", 20, "rows in the largest-exclusive and most-shared lists")
 		fl.Parse(args)
-		err = stats(*data)
+		err = stats(*data, *asJSON, *top)
 	case "units":
 		sub := fl.String("subsystem", "", "only this subsystem")
 		fl.Parse(args)
@@ -123,7 +129,7 @@ func open(dir string, quota int64) (*meta.DB, *cas.Store, error) {
 	return db, store, nil
 }
 
-func serve(dir, addrL, addr string, max int64, workers int) error {
+func serve(dir, addrL, addr string, max int64, workers int, shadow bool) error {
 	if addrL == "" && addr == "" {
 		return fmt.Errorf("serve: no listen address")
 	}
@@ -137,11 +143,27 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 		return err
 	}
 	quota := &fill.LocalQuota{Max: max, CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: spool.Bytes}
-	mgr, err := fill.NewManager(db, store, spool, quota, fill.Options{Workers: workers})
+	opts := fill.Options{Workers: workers}
+	if shadow {
+		opts.Shadow = filepath.Join(dir, shadowDir)
+		log.Printf("debug savings mode: shadow tree in %s (not counted by -max-gib)", opts.Shadow)
+	} else if _, err := os.Stat(filepath.Join(dir, shadowDir)); err == nil {
+		log.Printf("note: %s is left from a -debug-shadow run and is no longer kept up to date; remove it to free the space", filepath.Join(dir, shadowDir))
+	}
+	mgr, err := fill.NewManager(db, store, spool, quota, opts)
 	if err != nil {
 		return err
 	}
 	defer mgr.Close()
+	if shadow {
+		go func() {
+			if w, rm, err := mgr.SyncShadow(context.Background()); err != nil {
+				log.Printf("shadow: %v", err)
+			} else if w+rm > 0 {
+				log.Printf("shadow: wrote %d unit trees, removed %d", w, rm)
+			}
+		}()
+	}
 	idx, err := h9index.Open(context.Background(), db)
 	if err != nil {
 		return err
@@ -149,6 +171,7 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr, Index: idx,
 		Synthetic: map[string]tree.SyntheticFunc{
 			"usage": func(ctx context.Context) ([]byte, error) { return usageReport(ctx, db) },
+			"stats": func(ctx context.Context) ([]byte, error) { return statsReport(ctx, dir, db, store, mgr) },
 		}}
 	if err := fs.InitSynthetic(context.Background()); err != nil {
 		return err
@@ -162,7 +185,7 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 			return err
 		}
 	}
-	if err := startGC(db, store, mgr, quota, max); err != nil {
+	if err := startGC(db, store, mgr, quota, max, opts.Shadow); err != nil {
 		return err
 	}
 	if err := startUsage(context.Background(), db, mgr); err != nil {
@@ -299,28 +322,44 @@ func indexRoots(dir string, all bool, roots []string) error {
 	return nil
 }
 
-func stats(dir string) error {
+// shadowDir is the debug shadow tree, under the cache directory.
+const shadowDir = "shadow"
+
+func stats(dir string, asJSON bool, top int) error {
 	db, store, err := open(dir, 0)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	s, err := db.Stats(context.Background())
+	opts := savings.Options{Dir: dir, Top: top}
+	if _, err := os.Stat(filepath.Join(dir, shadowDir)); err == nil {
+		opts.Shadow = filepath.Join(dir, shadowDir)
+	}
+	r, err := savings.Measure(context.Background(), db, store, opts)
 	if err != nil {
 		return err
 	}
-	used, _ := store.Usage()
-	fmt.Printf("units            %d\n", s.Units)
-	fmt.Printf("inodes           %d\n", s.Inodes)
-	fmt.Printf("content objects  %d\n", s.Contents)
-	fmt.Printf("logical bytes    %s (all files)\n", size(s.FileBytes))
-	fmt.Printf("distinct bytes   %s (after whole-file dedup)\n", size(s.ContentBytes))
-	fmt.Printf("CAS blob bytes   %s (after chunk dedup)\n", size(used))
-	if s.FileBytes > 0 {
-		fmt.Printf("savings          %.1f%% (blob bytes vs logical; ignores filesystem overhead)\n",
-			100*(1-float64(used)/float64(s.FileBytes)))
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(r)
 	}
-	return nil
+	return r.WriteText(os.Stdout)
+}
+
+// statsReport renders /.cache/stats, first bringing the shadow tree up to
+// date in the debug savings mode.
+func statsReport(ctx context.Context, dir string, db *meta.DB, store *cas.Store, mgr *fill.LocalManager) ([]byte, error) {
+	if _, _, err := mgr.SyncShadow(ctx); err != nil {
+		log.Printf("shadow: %v", err)
+	}
+	r, err := savings.Measure(ctx, db, store, savings.Options{Dir: dir, Shadow: mgr.ShadowDir()})
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	err = r.WriteText(&buf)
+	return buf.Bytes(), err
 }
 
 func units(dir, sub string) error {

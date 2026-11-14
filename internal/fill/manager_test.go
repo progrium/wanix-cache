@@ -21,8 +21,10 @@ import (
 )
 
 // fakeSub serves units from memory. A unit is a map of path -> contents;
-// paths ending in "/" are directories, "->x" values are symlinks.
+// paths ending in "/" are directories, "->x" values are symlinks, "=>x"
+// values are hard links to x.
 type fakeSub struct {
+	name    string // default "fake"
 	units   map[subsys.Key]map[string]string
 	order   map[subsys.Key][]string
 	digest  map[subsys.Key]string
@@ -31,7 +33,12 @@ type fakeSub struct {
 	fail    error         // if set, Fetch fails after writing
 }
 
-func (f *fakeSub) Name() string { return "fake" }
+func (f *fakeSub) Name() string {
+	if f.name != "" {
+		return f.name
+	}
+	return "fake"
+}
 func (f *fakeSub) Migrations() []meta.Migration {
 	return []meta.Migration{{Version: 1, SQL: `CREATE TABLE fake_x (a)`}}
 }
@@ -45,7 +52,7 @@ func (f *fakeSub) Resolve(_ context.Context, p string) (subsys.Key, string, erro
 func (f *fakeSub) Describe(_ context.Context, k subsys.Key) (subsys.Info, error) {
 	var n int64
 	for _, v := range f.units[k] {
-		if !strings.HasPrefix(v, "->") {
+		if !strings.HasPrefix(v, "->") && !strings.HasPrefix(v, "=>") {
 			n += int64(len(v))
 		}
 	}
@@ -63,6 +70,10 @@ func (f *fakeSub) Fetch(ctx context.Context, k subsys.Key, s subsys.Sink) error 
 			}
 		case strings.HasPrefix(v, "->"):
 			if err := s.Symlink(p, v[2:], now); err != nil {
+				return err
+			}
+		case strings.HasPrefix(v, "=>"):
+			if err := s.Hardlink(p, v[2:]); err != nil {
 				return err
 			}
 		default:

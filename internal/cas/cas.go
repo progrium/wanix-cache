@@ -34,7 +34,8 @@ var ErrFull = syscall.ENOSPC
 
 // Store is a quota-limited Perkeep blob store.
 type Store struct {
-	q *quotaStore
+	q   *quotaStore
+	dir string // the localdisk root, dir/blobs
 
 	// holds and deleting close the race between ingest and the sweeper:
 	// an ingest that dedups against a blob the DB says is unreferenced must
@@ -73,7 +74,7 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := &Store{q: q, holds: map[blob.Ref]int{}, deleting: map[blob.Ref]bool{}}
+	st := &Store{q: q, dir: bdir, holds: map[blob.Ref]int{}, deleting: map[blob.Ref]bool{}}
 	st.hcond = sync.NewCond(&st.hmu)
 	return st, nil
 }

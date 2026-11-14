@@ -31,6 +31,12 @@ type Options struct {
 	// HoldIngest leaves spooled units in the spool until ResumeIngest is
 	// called. For tests, and for inspecting the spool.
 	HoldIngest bool
+	// Shadow, if set, turns on the debug savings mode: after ingest each
+	// resident unit is also kept unpacked as a plain tree under
+	// Shadow/<subsystem>/<unit id>, hard-linked from its spool files, so
+	// disk use can be compared with the CAS (see internal/savings). Shadow
+	// bytes are not counted by the quota and are removed on eviction.
+	Shadow string
 }
 
 // LocalManager is the Manager for one cache directory.
@@ -51,7 +57,8 @@ type LocalManager struct {
 	// ingesting counts ingestUnit calls in progress, so Wait covers the
 	// gap between the resident commit and the spool removal.
 	ingesting atomic.Int64
-	resume chan struct{}
+	shadowMu  sync.Mutex // serializes shadow tree writes and SyncShadow
+	resume    chan struct{}
 
 	mu       sync.Mutex
 	changed  *sync.Cond // broadcast on spool file creation and fill end
@@ -857,10 +864,15 @@ func (m *LocalManager) ingestUnit(id int64) error {
 		m.spool.Unrelease(id, released)
 		return err
 	}
+	u, _ = m.db.UnitByID(ctx, id)
+	if m.opts.Shadow != "" {
+		if err := m.shadowUnit(ctx, u); err != nil {
+			m.opts.Logf("fill: unit %d: shadow tree: %v", id, err)
+		}
+	}
 	if err := m.spool.Remove(id); err != nil {
 		m.opts.Logf("fill: unit %d: removing spool: %v", id, err)
 	}
-	u, _ = m.db.UnitByID(ctx, id)
 	m.emit(UnitEvent{Unit: u, From: meta.UnitSpooled, To: meta.UnitResident})
 	return nil
 }
