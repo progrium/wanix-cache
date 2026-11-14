@@ -62,6 +62,7 @@ type LocalManager struct {
 
 	mu       sync.Mutex
 	changed  *sync.Cond // broadcast on spool file creation and fill end
+	gen      uint64     // bumped with every changed broadcast (see broadcast)
 	subs     map[string]subsys.Subsystem
 	flights  map[string]*flight
 	watchers []func(UnitEvent)
@@ -309,6 +310,7 @@ func (m *LocalManager) fill(s subsys.Subsystem, key subsys.Key, fk string, f *fl
 	delete(m.flights, fk)
 	f.start()
 	close(f.done)
+	m.gen++
 	m.changed.Broadcast()
 	m.mu.Unlock()
 }
@@ -569,6 +571,7 @@ func (m *LocalManager) open(ctx context.Context, in meta.Inode) (cas.File, error
 func (m *LocalManager) waitChange(ctx context.Context, ino uint64, f *flight) error {
 	stop := context.AfterFunc(ctx, func() {
 		m.mu.Lock()
+		m.gen++
 		m.changed.Broadcast()
 		m.mu.Unlock()
 	})
@@ -660,6 +663,7 @@ func (m *LocalManager) Miss(ctx context.Context, dir, name string) (bool, error)
 	full := "/" + rest
 	stop := context.AfterFunc(ctx, func() {
 		m.mu.Lock()
+		m.gen++
 		m.changed.Broadcast()
 		m.mu.Unlock()
 	})
@@ -675,13 +679,18 @@ func (m *LocalManager) Miss(ctx context.Context, dir, name string) (bool, error)
 			return true, f.err
 		default:
 		}
+		// exists runs unlocked, so a broadcast can land before we Wait:
+		// only wait if nothing changed since we looked.
+		gen := m.gen
 		m.mu.Unlock()
 		found := m.exists(ctx, full)
 		m.mu.Lock()
 		if found {
 			return true, nil
 		}
-		m.changed.Wait()
+		if m.gen == gen {
+			m.changed.Wait()
+		}
 	}
 }
 
@@ -966,6 +975,7 @@ func (s *fillSink) do(fn func(tx *meta.Tx) error) error {
 		return err
 	}
 	s.m.mu.Lock()
+	s.m.gen++
 	s.m.changed.Broadcast()
 	s.m.mu.Unlock()
 	return nil
@@ -1048,6 +1058,7 @@ func (s *fillSink) File(p string, mode fs.FileMode, size int64, mtime time.Time)
 		return nil, err
 	}
 	s.m.mu.Lock()
+	s.m.gen++
 	s.m.changed.Broadcast()
 	s.m.mu.Unlock()
 	f := &sinkFile{s: s, ino: ino, want: size, mode: uint32(mode.Perm()), mtime: mtime, w: w}
