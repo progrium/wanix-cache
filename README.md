@@ -227,9 +227,12 @@ needed on the cache side.
   Looking it up fetches the narinfo, streams the NAR (xz, zstd, bzip2, gzip
   or none), checks the NarHash over the stream, and unpacks it into the
   spool and then the CAS, so files dedupe across paths and subsystems.
-- `/nix/closure/<hash>-<name>/` is the path's whole closure as a root:
-  `nix/store/<member>/...` for every path reachable through narinfo
-  References. Members are faulted in as their own units first.
+- `/nix/closure/<hash>-<name>/` is the path's whole closure as a root, as
+  a metadata-only view (`subsys.Viewer`): `nix/store/<member>/` for every
+  path reachable through narinfo References, each the member's own unit.
+  Using a view starts every member's fill, pins the members until it has
+  been idle for 10 minutes, and gets the root a `/.h9index` once every
+  member has its manifest.
 - `-nix-cache ADDR` serves a binary cache (`nix-cache-info`, `<hash>.narinfo`,
   `nar/<hash>.nar`) with `Compression: none`. NARs are rebuilt from the tree
   and match the upstream NarHash; upstream signatures pass through unchanged,
@@ -237,7 +240,8 @@ needed on the cache side.
   `nix copy --from http://HOST:PORT /nix/store/...` or
   `--option substituters http://HOST:PORT`.
 - Eviction goes from the leaves inward (`subsys.EvictionOrderer`): a path is
-  a candidate only when no live path or closure refers to it.
+  a candidate only when no live path refers to it, and paths in a closure
+  view in use are pinned.
   `-nix-evict-delete` runs `nix-store --delete` first (`subsys.Evicter`).
 - Usage is per store path: the package name and version come from the store
   name (`hello-2.12.1` is `hello`, `2.12.1`).

@@ -6,9 +6,9 @@
 // Namespace, under /nix/:
 //
 //	store/<hash>-<name>/...   one store path, unit key "<hash>-<name>"
-//	closure/<hash>-<name>/    a closure as a root: nix/store/<member>/... for
-//	                          every path in the closure, unit key
-//	                          "closure:<hash>-<name>"
+//	closure/<hash>-<name>/    a view: the path's closure as a root, with
+//	                          nix/store/<member>/ for every path in it
+//	                          (view.go)
 //
 // A store path's NAR is fetched, decompressed and unpacked into the spool as
 // it streams, so the tree is stored as files (which dedupe in the CAS) and
@@ -42,9 +42,6 @@ import (
 // Name is the subsystem name and namespace root.
 const Name = "nix"
 
-// closurePrefix marks closure unit keys.
-const closurePrefix = "closure:"
-
 // storeMtime is the mtime Nix gives everything in the store.
 var storeMtime = time.Unix(1, 0)
 
@@ -62,11 +59,14 @@ type Options struct {
 	// NegativeTTL is how long a path no substituter has is remembered as
 	// missing. Default 10 minutes.
 	NegativeTTL time.Duration
-	// Indexer, if set, gets IndexRoot("/nix/closure/<path>") each time a
-	// closure's manifest completes, so H9 sees its /.h9index.
+	// Indexer, if set, gets IndexRoot("/nix/closure/<path>") once every
+	// member of a closure view has its manifest, so H9 sees its /.h9index.
 	Indexer subsys.RootIndexer
 	// Logf receives background errors. Default: discarded.
 	Logf func(string, ...any)
+	// ViewIdle is how long a closure view keeps its store paths pinned
+	// against eviction after its last lookup. Default 10 minutes.
+	ViewIdle time.Duration
 	// Now is the clock, for tests.
 	Now func() time.Time
 }
@@ -81,6 +81,7 @@ type Subsystem struct {
 	missing map[string]time.Time // hash -> expiry
 	flights map[string]*niFlight
 	mgr     fill.Manager
+	views   viewState
 }
 
 type niFlight struct {
@@ -94,6 +95,7 @@ var (
 	_ subsys.Evicter         = (*Subsystem)(nil)
 	_ subsys.EvictionOrderer = (*Subsystem)(nil)
 	_ subsys.Scaffolder      = (*Subsystem)(nil)
+	_ subsys.Viewer          = (*Subsystem)(nil)
 )
 
 // New returns the Nix subsystem using db for its tables.
@@ -107,10 +109,14 @@ func New(db *meta.DB, opts Options) (*Subsystem, error) {
 	if opts.NegativeTTL == 0 {
 		opts.NegativeTTL = 10 * time.Minute
 	}
+	if opts.ViewIdle == 0 {
+		opts.ViewIdle = 10 * time.Minute
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
 	s := &Subsystem{db: db, opts: opts, missing: map[string]time.Time{}, flights: map[string]*niFlight{}}
+	s.views.init()
 	for _, raw := range opts.Substituters {
 		u, err := url.Parse(strings.TrimSuffix(raw, "/") + "/")
 		if err != nil {
@@ -121,38 +127,20 @@ func New(db *meta.DB, opts Options) (*Subsystem, error) {
 	return s, nil
 }
 
-// Attach gives the subsystem the fill manager it is registered with, so
-// closures and the binary cache read member paths from the cache (faulting
-// them in as units) instead of straight from upstream. Call it after
-// Register.
+// Attach gives the subsystem the fill manager it is registered with, which
+// closure views and the binary cache use to fault store paths in. Call it
+// after Register.
 func (s *Subsystem) Attach(ctx context.Context, m fill.Manager) error {
 	s.mu.Lock()
 	s.mgr = m
 	s.mu.Unlock()
-	if s.opts.Indexer != nil {
-		m.Watch(s.indexClosure)
-	}
 	return nil
 }
 
-// Dirs implements subsys.Scaffolder: /nix/store and /nix/closure exist
-// before anything is cached, so a guest can walk into them and a miss
-// inside them faults.
-func (s *Subsystem) Dirs() []string { return []string{"store", "closure"} }
-
-// indexClosure indexes a closure root once its manifest is complete. Its
-// members were all filled (spooled or resident) before it, by Fetch.
-func (s *Subsystem) indexClosure(ev fill.UnitEvent) {
-	sp, ok := strings.CutPrefix(ev.Unit.Key, closurePrefix)
-	if ev.Unit.Subsystem != Name || !ok || ev.To != meta.UnitSpooled {
-		return
-	}
-	go func() {
-		if err := s.opts.Indexer.IndexRoot(context.Background(), "/nix/closure/"+sp); err != nil && s.opts.Logf != nil {
-			s.opts.Logf("nix: indexing closure %s: %v", sp, err)
-		}
-	}()
-}
+// Dirs implements subsys.Scaffolder: /nix/store exists before anything is
+// cached, so a guest can walk into it and a miss inside it faults.
+// /nix/closure is virtual (view.go).
+func (s *Subsystem) Dirs() []string { return []string{"store"} }
 
 func (s *Subsystem) manager() fill.Manager {
 	s.mu.Lock()
@@ -183,61 +171,33 @@ CREATE INDEX nix_ref_reference ON nix_ref (reference);`},
 
 // Resolve implements subsys.Subsystem.
 func (s *Subsystem) Resolve(ctx context.Context, p string) (subsys.Key, string, error) {
-	top, rest, _ := strings.Cut(p, "/")
+	rest, ok := strings.CutPrefix(p, "store/")
+	if !ok {
+		return "", "", fs.ErrNotExist
+	}
 	base, rel, _ := strings.Cut(rest, "/")
 	sp, err := ParseStorePath(base)
 	if err != nil {
 		return "", "", fs.ErrNotExist
 	}
-	switch top {
-	case "store":
-		return subsys.Key(sp), rel, nil
-	case "closure":
-		return subsys.Key(closurePrefix + string(sp)), rel, nil
-	}
-	return "", "", fs.ErrNotExist
+	return subsys.Key(sp), rel, nil
 }
 
-func parseKey(key subsys.Key) (sp StorePath, closure bool, err error) {
-	k := string(key)
-	if c, ok := strings.CutPrefix(k, closurePrefix); ok {
-		k, closure = c, true
-	}
-	sp, err = ParseStorePath(k)
+func parseKey(key subsys.Key) (StorePath, error) {
+	sp, err := ParseStorePath(string(key))
 	if err != nil {
-		return "", false, fmt.Errorf("nix: bad unit key %q: %w", key, fs.ErrNotExist)
+		return "", fmt.Errorf("nix: bad unit key %q: %w", key, fs.ErrNotExist)
 	}
-	return sp, closure, nil
+	return sp, nil
 }
 
 // Describe implements subsys.Subsystem.
 func (s *Subsystem) Describe(ctx context.Context, key subsys.Key) (subsys.Info, error) {
-	sp, closure, err := parseKey(key)
+	sp, err := parseKey(key)
 	if err != nil {
 		return subsys.Info{}, err
 	}
 	name, version := sp.Package()
-	if closure {
-		members, err := s.Closure(ctx, sp)
-		if err != nil {
-			return subsys.Info{}, err
-		}
-		info := subsys.Info{Mount: "closure/" + string(sp), Name: name, Version: version}
-		var refs []StorePath
-		for _, m := range members {
-			ni, err := s.NarInfo(ctx, m)
-			if err != nil {
-				return subsys.Info{}, err
-			}
-			info.Size += ni.NarSize
-			info.Deps = append(info.Deps, subsys.Key(m))
-			refs = append(refs, m)
-		}
-		if err := s.recordRefs(ctx, string(key), refs); err != nil {
-			return subsys.Info{}, err
-		}
-		return info, nil
-	}
 	ni, err := s.NarInfo(ctx, sp)
 	if err != nil {
 		return subsys.Info{}, err
@@ -257,49 +217,19 @@ func (s *Subsystem) Describe(ctx context.Context, key subsys.Key) (subsys.Info, 
 
 // Fetch implements subsys.Subsystem.
 func (s *Subsystem) Fetch(ctx context.Context, key subsys.Key, sink subsys.Sink) error {
-	sp, closure, err := parseKey(key)
+	sp, err := parseKey(key)
 	if err != nil {
 		return err
 	}
-	if !closure {
-		ni, err := s.NarInfo(ctx, sp)
-		if err != nil {
-			return err
-		}
-		digest, err := s.unpack(ctx, ni, sink, "", s.upstreamNAR)
-		if err != nil {
-			return err
-		}
-		sink.Digest(digest)
-		return nil
-	}
-	members, err := s.Closure(ctx, sp)
+	ni, err := s.NarInfo(ctx, sp)
 	if err != nil {
 		return err
 	}
-	if err := sink.Dir("nix", 0o555, storeMtime); err != nil {
+	digest, err := s.unpack(ctx, ni, sink, "", s.upstreamNAR)
+	if err != nil {
 		return err
 	}
-	if err := sink.Dir("nix/store", 0o555, storeMtime); err != nil {
-		return err
-	}
-	open := s.upstreamNAR
-	if s.manager() != nil {
-		open = s.localNAR
-	}
-	for _, m := range members {
-		ni, err := s.NarInfo(ctx, m)
-		if err != nil {
-			return err
-		}
-		digest, err := s.unpack(ctx, ni, sink, "nix/store/"+string(m), open)
-		if err != nil {
-			return fmt.Errorf("nix: closure %s: %s: %w", sp, m, err)
-		}
-		if digest != ni.NarHash {
-			return fmt.Errorf("%w: %s: want %s, got %s", fill.ErrDigestMismatch, m, ni.NarHash, digest)
-		}
-	}
+	sink.Digest(digest)
 	return nil
 }
 
@@ -385,26 +315,6 @@ func (s *Subsystem) upstreamNAR(ctx context.Context, ni *NarInfo) (io.ReadCloser
 		return nil, err
 	}
 	return sub.nar(ctx, ni)
-}
-
-// localNAR serializes a store path from its unit in the cache, faulting it
-// in first if needed.
-func (s *Subsystem) localNAR(ctx context.Context, ni *NarInfo) (io.ReadCloser, error) {
-	m := s.manager()
-	// The closure reads its members' files for itself, not for a client.
-	ctx = fill.Internal(ctx)
-	u, err := m.Ensure(ctx, Name, subsys.Key(ni.StorePath), true)
-	if err != nil {
-		return nil, err
-	}
-	release := m.Acquire(u.ID)
-	pr, pw := io.Pipe()
-	go func() {
-		defer release()
-		_, err := WriteNAR(pw, &unitTree{ctx: ctx, db: s.db, mgr: m, root: u.Root})
-		pw.CloseWithError(err)
-	}()
-	return pr, nil
 }
 
 // NAR writes a store path's NAR, rebuilt from the cache, to w. It faults
@@ -589,20 +499,6 @@ func (s *Subsystem) storeNarInfo(ctx context.Context, ni *NarInfo, text, sub str
 	return tx.Commit()
 }
 
-func (s *Subsystem) recordRefs(ctx context.Context, referrer string, refs []StorePath) error {
-	tx, err := s.db.SQL().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, r := range refs {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO nix_ref (referrer, reference) VALUES (?, ?)`, referrer, string(r)); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 // substituterFor returns the substituter a path's narinfo came from.
 func (s *Subsystem) substituterFor(ctx context.Context, sp StorePath) (*substituter, error) {
 	_, base, err := s.storedNarInfo(ctx, sp.Hash())
@@ -669,16 +565,10 @@ func (s *Subsystem) Closure(ctx context.Context, sp StorePath) ([]StorePath, err
 	return out, nil
 }
 
-// DerivedUnit implements usage.Derived: a closure is built from its member
-// units, so filling it is not an upstream fetch.
-func (s *Subsystem) DerivedUnit(key subsys.Key) bool {
-	return strings.HasPrefix(string(key), closurePrefix)
-}
-
 // OnEvict implements subsys.Evicter.
 func (s *Subsystem) OnEvict(ctx context.Context, key subsys.Key) error {
-	sp, closure, err := parseKey(key)
-	if err != nil || closure || s.opts.OnEvict == nil {
+	sp, err := parseKey(key)
+	if err != nil || s.opts.OnEvict == nil {
 		return nil
 	}
 	return s.opts.OnEvict(ctx, sp)
@@ -686,8 +576,9 @@ func (s *Subsystem) OnEvict(ctx context.Context, key subsys.Key) error {
 
 // EvictionOrder implements subsys.EvictionOrderer: Nix evicts from the
 // leaves inward. A store path is a candidate only when nothing that is
-// still live (fetching, spooled or resident) refers to it, whether another
-// store path or a closure. Candidates keep the caller's (LRU) order.
+// still live (fetching, spooled or resident) refers to it. Candidates keep
+// the caller's (LRU) order. Paths in an open closure view are pinned by the
+// view, so the reclaimer never offers them.
 func (s *Subsystem) EvictionOrder(ctx context.Context, units []meta.Unit) ([]meta.Unit, error) {
 	rows, err := s.db.SQL().QueryContext(ctx, `SELECT r.reference FROM nix_ref r
 		JOIN unit u ON u.subsystem = ? AND u.key = r.referrer

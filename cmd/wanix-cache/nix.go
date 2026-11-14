@@ -41,6 +41,7 @@ func registerNix(ctx context.Context, m *fill.LocalManager) error {
 	if err := n.Attach(ctx, m); err != nil {
 		return err
 	}
+	viewers[n.Name()] = n
 	if nixFlags.cacheAddr != "" {
 		ln, err := net.Listen("tcp", nixFlags.cacheAddr)
 		if err != nil {

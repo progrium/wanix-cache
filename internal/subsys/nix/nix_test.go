@@ -24,8 +24,9 @@ import (
 	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/ninep"
 	"github.com/progrium/wanix-cache/internal/subsys"
-	"github.com/progrium/wanix-cache/internal/usage"
+	"github.com/progrium/wanix-cache/internal/tree"
 )
 
 func TestBase32(t *testing.T) {
@@ -264,11 +265,12 @@ const (
 )
 
 type env struct {
-	ctx context.Context
-	db  *meta.DB
-	m   *fill.LocalManager
-	nix *Subsystem
-	fx  *fixtures
+	ctx   context.Context
+	db    *meta.DB
+	store *cas.Store
+	m     *fill.LocalManager
+	nix   *Subsystem
+	fx    *fixtures
 }
 
 func newEnv(t *testing.T, opts Options) *env {
@@ -310,7 +312,7 @@ func newEnv(t *testing.T, opts Options) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { srv.Close(); m.Close(); db.Close() })
-	return &env{ctx: ctx, db: db, m: m, nix: n, fx: fx}
+	return &env{ctx: ctx, db: db, store: store, m: m, nix: n, fx: fx}
 }
 
 func (e *env) read(t *testing.T, key subsys.Key, rel string) string {
@@ -451,38 +453,84 @@ func TestClosure(t *testing.T) {
 	if strings.Join(keysOf(got), " ") != strings.Join(keysOf(want), " ") {
 		t.Fatalf("closure = %v, want %v", got, want)
 	}
-	key, rel, err := e.nix.Resolve(ctx, "closure/"+string(appPath)+"/nix/store/"+string(libPath)+"/lib/libfoo.so")
-	if err != nil || key != subsys.Key("closure:"+string(appPath)) {
-		t.Fatalf("Resolve closure = %q %q %v", key, rel, err)
+	tfs := &tree.FS{Meta: e.db, CAS: e.store, Files: e.m, Faults: e.m}
+	if err := tfs.AddViewer(ctx, Name, e.nix); err != nil {
+		t.Fatal(err)
 	}
-	info, err := e.nix.Describe(ctx, key)
-	if err != nil || len(info.Deps) != 4 || info.Mount != "closure/"+string(appPath) {
-		t.Fatalf("Describe closure = %+v, %v", info, err)
+	walk := func(p string) ninep.Node {
+		t.Helper()
+		n, err := tfs.Root(ctx)
+		for _, name := range strings.Split(strings.Trim(p, "/"), "/") {
+			if err != nil {
+				break
+			}
+			n, err = tfs.Lookup(ctx, n, name)
+		}
+		if err != nil {
+			t.Fatalf("walk %s: %v", p, err)
+		}
+		return n
 	}
-	if got := e.read(t, key, rel); got != string(fixtureTree["lib/libfoo.so"].Data) {
+	readAll := func(p string) string {
+		t.Helper()
+		n := walk(p)
+		f, err := tfs.Open(ctx, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		b := make([]byte, n.Size)
+		if _, err := f.ReadAt(b, 0); err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	croot := "/nix/closure/" + string(appPath)
+	if got := readAll(croot + "/nix/store/" + string(libPath) + "/lib/libfoo.so"); got != string(fixtureTree["lib/libfoo.so"].Data) {
 		t.Fatal("closure file differs")
 	}
-	if got := e.read(t, key, "nix/store/"+string(filePath)); got != `{"a":1}` {
+	if got := readAll(croot + "/nix/store/" + string(filePath)); got != `{"a":1}` {
 		t.Fatalf("file root in closure = %q", got)
 	}
-	// The closure read its members through the cache, so each member is
-	// now a unit of its own and was downloaded once.
+	// Plain 9P2000 hides the symlink member; the view itself has all four.
+	ents, _, _, err := tfs.ReadDir(ctx, walk(croot+"/nix/store"), "", 100)
+	if err != nil || len(ents) != 3 {
+		t.Fatalf("closure store listing: %v, %v", ents, err)
+	}
+	des, err := e.nix.ViewReadDir(ctx, walk(croot+"/nix/store").Ino)
+	if err != nil || len(des) != 4 || des[1].Kind != meta.KindSymlink {
+		t.Fatalf("closure store view: %v, %v", des, err)
+	}
+	if _, err := tfs.Lookup(ctx, walk(croot+"/nix/store"), string(badPath)); err == nil {
+		t.Error("a path outside the closure resolved in its view")
+	}
+	if _, err := tfs.Lookup(ctx, walk("/nix/closure"), string(nonePath)); err == nil {
+		t.Error("closure of a missing path resolved")
+	}
+	// Members are units of their own, each downloaded once; the view
+	// itself is metadata only.
 	if err := e.m.Wait(ctx); err != nil {
 		t.Fatal(err)
 	}
 	for _, sp := range want {
-		if u, err := e.db.Unit(ctx, Name, string(sp)); err != nil || u.State != meta.UnitResident {
+		u, err := e.db.Unit(ctx, Name, string(sp))
+		if err != nil || u.State != meta.UnitResident {
 			t.Errorf("member %s: %+v, %v", sp, u, err)
 		}
 	}
 	if c := e.fx.count("nar/" + libPath.Hash() + ".nar.xz"); c != 1 {
 		t.Errorf("lib NAR downloaded %d times", c)
 	}
-	u, _ := e.db.Unit(ctx, Name, string(key))
-	if p, _ := e.db.PathOf(ctx, u.Root); p != "/nix/closure/"+string(appPath) {
-		t.Errorf("closure mounted at %s", p)
+	units, _ := e.db.Units(ctx, Name)
+	if len(units) != 4 {
+		t.Errorf("%d units, want the 4 members only", len(units))
 	}
-	for i := 0; i < 100; i++ {
+	// While the view is in use, its members are pinned.
+	u, _ := e.db.Unit(ctx, Name, string(libPath))
+	if !e.m.Pinned(u.ID) {
+		t.Error("member not pinned while the view is in use")
+	}
+	for i := 0; i < 200; i++ {
 		idx.mu.Lock()
 		n := len(idx.roots)
 		idx.mu.Unlock()
@@ -493,8 +541,31 @@ func TestClosure(t *testing.T) {
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	if len(idx.roots) != 1 || idx.roots[0] != "/nix/closure/"+string(appPath) {
+	if len(idx.roots) != 1 || idx.roots[0] != croot {
 		t.Errorf("indexed roots = %v, want the closure once", idx.roots)
+	}
+}
+
+func TestViewIdleUnpins(t *testing.T) {
+	e := newEnv(t, Options{ViewIdle: 500 * time.Millisecond})
+	ctx := e.ctx
+	tfs := &tree.FS{Meta: e.db, CAS: e.store, Files: e.m, Faults: e.m}
+	tfs.AddViewer(ctx, Name, e.nix)
+	n, _ := tfs.Root(ctx)
+	var err error
+	for _, name := range []string{"nix", "closure", string(libPath), "nix", "store", string(libPath)} {
+		if n, err = tfs.Lookup(ctx, n, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.m.Wait(ctx)
+	u, _ := e.db.Unit(ctx, Name, string(libPath))
+	if !e.m.Pinned(u.ID) {
+		t.Fatal("not pinned in use")
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if e.m.Pinned(u.ID) {
+		t.Fatal("still pinned after the view went idle")
 	}
 }
 
@@ -609,8 +680,6 @@ func TestBinaryCache(t *testing.T) {
 		t.Errorf("bogus: %d", code)
 	}
 }
-
-var _ usage.Derived = (*Subsystem)(nil)
 
 func mustLookup(t *testing.T, e *env, p string) uint64 {
 	t.Helper()

@@ -56,6 +56,9 @@ func TestUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	if err := tfs.AddViewer(ctx, Name, n); err != nil {
+		t.Fatal(err)
+	}
 	go tree.NewDotLServer(tfs).Serve(ln)
 	bc := httptest.NewServer(&BinaryCache{Nix: n, Logf: t.Logf})
 	t.Cleanup(func() { bc.Close(); ln.Close(); m.Close(); db.Close() })
