@@ -66,8 +66,16 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	q := &quotaStore{Storage: statNoCancel{raw}, max: maxBytes}
-	err = blobserver.EnumerateAll(context.Background(), raw, func(sr blob.SizedRef) error {
+	var storage blobserver.Storage = statNoCancel{raw}
+	if max, err := packing(bdir); err != nil {
+		return nil, err
+	} else if max > 0 {
+		if storage, err = newSplit(bdir, storage, max); err != nil {
+			return nil, err
+		}
+	}
+	q := &quotaStore{Storage: storage, max: maxBytes}
+	err = blobserver.EnumerateAll(context.Background(), storage, func(sr blob.SizedRef) error {
 		q.used += int64(sr.Size)
 		return nil
 	})
@@ -77,6 +85,15 @@ func Open(dir string, maxBytes int64) (*Store, error) {
 	st := &Store{q: q, dir: bdir, holds: map[blob.Ref]int{}, deleting: map[blob.Ref]bool{}}
 	st.hcond = sync.NewCond(&st.hmu)
 	return st, nil
+}
+
+// Close releases the store's files. Only a store with small-blob packing
+// holds any (the pack index's lock); closing a plain store does nothing.
+func (s *Store) Close() error {
+	if c, ok := s.q.Storage.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // SetReclaimer installs a function that frees space when a new blob would

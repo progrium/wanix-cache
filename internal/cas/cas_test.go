@@ -14,7 +14,7 @@ import (
 
 func TestPutDeterministicAndDeduped(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(t.TempDir(), 0)
+	s, err := openStore(t, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestPutDeterministicAndDeduped(t *testing.T) {
 }
 
 func TestQuota(t *testing.T) {
-	s, err := Open(t.TempDir(), 64<<10)
+	s, err := openStore(t, 64<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestQuota(t *testing.T) {
 
 func TestBlobsRemoveAndHolds(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(t.TempDir(), 0)
+	s, err := openStore(t, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestBlobsRemoveAndHolds(t *testing.T) {
 
 func TestReclaimerBeforeFull(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(t.TempDir(), 600<<10)
+	s, err := openStore(t, 600<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestReclaimerBeforeFull(t *testing.T) {
 // stat with an already-cancelled context takes a slot of the process-wide
 // gate and never returns it, so after 20 of them every stat blocks.
 func TestCancelledStatsDoNotWedge(t *testing.T) {
-	s, err := Open(t.TempDir(), 0)
+	s, err := openStore(t, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

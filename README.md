@@ -341,6 +341,16 @@ one 4 KiB block per blob file (two per file) plus one per hash-prefix
 directory. That is the "per-blob overhead above 10%" row of the test plan's
 decision table, before the larger workloads have run.
 
+**Small-blob packing (experimental).** `serve -pack-small N` stores blobs
+of at most N bytes in Perkeep diskpacked pack files under `blobs/packed`
+(LevelDB index, holes punched on delete) instead of one localdisk file
+each; it is recorded in `blobs/packed/THRESHOLD` and stays on. The pack
+index is locked by one process, so stop the server before `stats`, `gc` or
+`audit`. On W7 of the savings plan (3.9 GiB logical): CAS 3.57 GiB
+without it, 3.13 GiB at 64 KiB (4.9% below hard-linked plain disk), 2.98
+GiB packing every blob (9.5% below), but diskpacked syncs every blob, so
+packing everything doubled the time to ingest W7 (504 s against 261 s).
+
 ## Measurements (phase 1)
 
 - Lookup by `(parent, name)`: 7 µs at 1k entries, 12 µs at 100k entries

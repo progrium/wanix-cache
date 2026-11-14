@@ -1,6 +1,6 @@
 // Command wanix-cache is the H9 read-through cache.
 //
-//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR] [-debug-shadow]
+//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR] [-debug-shadow] [-pack-small N]
 //	wanix-cache import [-data DIR] [-max-gib N] -key NAME SRC
 //	wanix-cache index  [-data DIR] [-all] [ROOT...]
 //	wanix-cache stats  [-data DIR] [-json] [-n N]
@@ -73,9 +73,15 @@ func main() {
 		addr := fl.String("9p2000", "", "plain 9P2000 TCP listen address (no symlinks); empty to disable")
 		gib := fl.Int64("max-gib", 10, "cap on CAS + spool bytes, GiB; 0 = unlimited")
 		workers := fl.Int("ingest-workers", 4, "files ingested into the CAS concurrently")
+		pack := fl.Int("pack-small", 0, "experimental: from now on store blobs of at most this many bytes in pack files (Perkeep diskpacked) instead of one file each; stays on once set. With it, stop the server before stats, gc or audit")
 		shadow := fl.Bool("debug-shadow", false, "debug savings mode: also keep every resident unit unpacked on plain disk under DATA/shadow, for /.cache/stats and `stats` (not counted by -max-gib)")
 		addSubsystemFlags(fl)
 		fl.Parse(args)
+		if *pack > 0 {
+			if err := cas.EnablePacking(*data, *pack); err != nil {
+				log.Fatal(err)
+			}
+		}
 		err = serve(*data, *addrL, *addr, *gib<<30, *workers, *shadow)
 	case "import":
 		key := fl.String("key", "", "unit key (defaults to the source directory's name)")
@@ -138,6 +144,7 @@ func serve(dir, addrL, addr string, max int64, workers int, shadow bool) error {
 		return err
 	}
 	defer db.Close()
+	defer store.Close()
 	spool, err := fill.OpenDiskSpool(filepath.Join(dir, "spool"))
 	if err != nil {
 		return err

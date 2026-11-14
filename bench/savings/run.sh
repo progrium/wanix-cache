@@ -7,7 +7,7 @@
 # Env: CORPUS (corpus dir, default ./corpus), WORK (cache dirs, default
 # ./work), OUT (results, default ./results), BIN (dir with wanix-cache and
 # savingsbench), KEEP=1 keeps the cache dir, LINK=1 measures B3 by actually
-# hard-linking the shadow tree, AGAIN=1 drives every input a second time
+# hard-linking the shadow tree, PACK=N serves with -pack-small N, AGAIN=1 drives every input a second time
 # into the same cache after measuring (W8).
 #
 # The corpus server (savingsbench serve-corpus) must already be running on
@@ -19,7 +19,7 @@ D=$WORK/$name; R=$OUT/$name
 rm -rf "$D" "$R"; mkdir -p "$D" "$R"
 P9L=127.0.0.1:5640; P9=127.0.0.1:5641; MIRROR=127.0.0.1:8404
 
-"$BIN/wanix-cache" serve -data "$D" -debug-shadow -max-gib 0 -9p $P9L -9p2000 $P9 \
+"$BIN/wanix-cache" serve -data "$D" -debug-shadow -max-gib 0 ${PACK:+-pack-small $PACK} -9p $P9L -9p2000 $P9 \
   -apk-upstream http://127.0.0.1:8401 -apk-mirror $MIRROR -apk-index-ttl 1h \
   -nix-substituters http://127.0.0.1:8403/ >"$R/serve.log" 2>&1 &
 srv=$!
