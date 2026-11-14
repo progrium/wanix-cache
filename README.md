@@ -359,13 +359,16 @@ without it, 3.13 GiB at 64 KiB (4.9% below hard-linked plain disk), 2.98
 GiB packing every blob (9.5% below), but diskpacked syncs every blob, so
 packing everything doubled the time to ingest W7 (504 s against 261 s).
 
-**Per-blob zstd (experimental).** `serve -zstd L` (1 fastest to 4 best),
+**Per-blob zstd (optional, off by default).** Read speed comes before
+storage, so compression is opt-in. `serve -zstd L` (1 fastest to 4 best),
 only on a new, empty cache, stores every blob as a header byte and either
 its bytes or a zstd frame of them, whichever is smaller. Refs stay hashes
 of the uncompressed bytes, so dedupe is unchanged. With `-pack-small 65536`
 it took W7 to 1.45 GiB (56% below hard-linked plain disk) and 293 s to
-ingest. Blob sizes in `stats` are then stored (compressed) bytes, so its
-chunk-dedupe ratio also counts compression.
+ingest. The cost is reads: over 9P2000.L, with the namespace cache, a W7
+re-read went from 12,487 to 8,016 files a second, and large files from
+about 1.7 to 1.0 GiB/s. Blob sizes in `stats` are then stored
+(compressed) bytes, so its chunk-dedupe ratio also counts compression.
 
 ## Measurements (phase 1)
 

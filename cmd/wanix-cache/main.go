@@ -74,7 +74,7 @@ func main() {
 		gib := fl.Int64("max-gib", 10, "cap on CAS + spool bytes, GiB; 0 = unlimited")
 		workers := fl.Int("ingest-workers", 4, "files ingested into the CAS concurrently")
 		pack := fl.Int("pack-small", 0, "experimental: from now on store blobs of at most this many bytes in pack files (Perkeep diskpacked) instead of one file each; stays on once set. With it, stop the server before stats, gc or audit")
-		zst := fl.Int("zstd", 0, "experimental: compress every blob with zstd at this level (1 fastest to 4 best); only on a new, empty cache, and stays on")
+		zst := fl.Int("zstd", 0, "optional, off by default (0): compress every blob with zstd at this level (1 fastest to 4 best), trading read speed for space; only on a new, empty cache, and stays on")
 		shadow := fl.Bool("debug-shadow", false, "debug savings mode: also keep every resident unit unpacked on plain disk under DATA/shadow, for /.cache/stats and `stats` (not counted by -max-gib)")
 		addSubsystemFlags(fl)
 		fl.Parse(args)
