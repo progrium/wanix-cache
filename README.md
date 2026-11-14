@@ -21,8 +21,9 @@ the debug savings mode, and the subsystems come in later phases.
 | `internal/ingest` | Imports a local directory as a unit (stand-in for subsystem fetchers) |
 | `internal/subsys` | The `Subsystem` interface each subsystem implements, and the conventions below |
 | `internal/fill` | The fill-path API: unit manager, spool, quota, reclaimer hook (implementation in progress) |
+| `internal/h9index` | Generates, stores and serves each root's `/.h9index` (hyper9's mount-index) from metadata |
 | `internal/gc` | Eviction and blob GC: global refcounts, LRU with watermarks, pins, sweep, audit |
-| `cmd/wanix-cache` | `serve`, `import`, `stats`, `units`, `gc`, `evict`, `refault`, `audit`, `pin` |
+| `cmd/wanix-cache` | `serve`, `import`, `index`, `stats`, `units`, `gc`, `evict`, `refault`, `audit`, `pin` |
 
 ## Try it
 
@@ -35,7 +36,10 @@ go run ./cmd/wanix-cache serve -data ./cache -9p 127.0.0.1:5640 -9p2000 127.0.0.
 # Linux: mount -t 9p -o trans=tcp,port=5640,version=9p2000.L,ro 127.0.0.1 /mnt
 ```
 
-Imported trees appear at `/local/<key>`.
+Imported trees appear at `/local/<key>`, each with a generated `/.h9index`.
+Attach to one as a root by giving its path as the attach name
+(`aname=local/alpine`), and regenerate indexes with
+`wanix-cache index -data ./cache /local/alpine` or `-all`.
 
 ## Design notes
 
@@ -83,6 +87,53 @@ Imported trees appear at `/local/<key>`.
 - **Audit** (`wanix-cache audit [-fix] [-deep]`) recomputes both refcounts,
   compares them with the blobs on disk, deletes orphans, and evicts units
   whose blobs are missing so they refetch.
+
+## h9index for roots
+
+Every root the cache serves can carry a generated
+[`/.h9index`](https://github.com/progrium/hyper9/blob/main/design/mount-index.md),
+so h9 answers walks, stats and directory reads from it and only opens and
+reads reach the cache.
+
+- **Attach names select roots.** Both servers treat the attach name as a
+  path into the namespace (`local/alpine`, `nix/closure/<path>`), and `..`
+  stops at the attach root. An empty attach name is the whole namespace,
+  which has no index.
+- **From metadata only.** `h9index.Generate` lists the tree through the same
+  functions the servers answer `Tstat` and directory reads with
+  (`ninep.Stat`, and `lqid`/`lattr` for .L), never reading file bytes or
+  faulting anything in, so an evicted root can be indexed and its index
+  stays served. `tree.FS.IndexSources` provides those listings.
+- **One index per transport.** h9 can mount a root over plain 9P2000 or
+  9P2000.L. The 9P2000 server hides symlinks, so its index (`9p`) leaves them
+  out; the .L server's index (`dotl`) lists them with `DMSYMLINK` and the
+  target's length, as h9's translator is expected to present them to
+  devmnt. Each server serves its own variant at the same path, with its own
+  qid.
+- **Format.** `h9index 1`, then one line per name sorted by full path in byte
+  order; a name with a space, a newline or a non-UTF-8 byte is left out and
+  its directory gets an `!unindexed /dir` line. `/.h9index` doesn't list
+  itself. It covers every file in the cache's tree; it doesn't know what h9
+  binds over.
+- **qid.vers is 0** for every file in both servers: unit trees never change
+  in place, and a version derived from the CAS ref changed when ingest set
+  it, which h9 would see as a stale file.
+- **Storage and serving.** The text is kept in `h9index_file` (owner
+  `h9index`, its own migrations), keyed by root directory and variant, and
+  pinned to that directory's mtime and unit so a reused inode never serves
+  another tree's index. The file is a synthetic `0444` entry in the root,
+  listed by both servers, with qid.path `dir | 1<<63` (`| 1<<62` for .L),
+  qid.vers the FNV-32a of the text, and mtime the time the text last
+  changed. Regenerating an unchanged tree changes nothing, so h9's host cache
+  keeps hitting. A generated index shadows a `.h9index` shipped in the tree.
+- **Hook.** A subsystem calls `subsys.RootIndexer.IndexRoot(ctx, path)` once
+  every unit under a root has its manifest, and again if the tree changes.
+  While serving, `rootIndexer` in `cmd/wanix-cache` is set before
+  `registerSubsystems`, so a subsystem's register function can hand it over.
+  Indexing fails with `h9index.ErrNotReady` while a unit under the root is
+  absent or fetching, since a partial listing would make h9 answer "does not
+  exist" for names that are coming. Local imports are indexed when the
+  import finishes.
 
 ## Subsystem conventions
 

@@ -121,3 +121,16 @@ type Sink interface {
 type EvictionOrderer interface {
 	EvictionOrder(ctx context.Context, units []meta.Unit) ([]meta.Unit, error)
 }
+
+// RootIndexer is the h9index hook (internal/h9index). A subsystem that
+// assembles trees meant to be mounted as a root or a namespace layer (an
+// OCI image's merged rootfs, a Nix closure, an APK package layer) calls
+// IndexRoot with the root's namespace path ("/oci/<repo>@<digest>/rootfs")
+// once every unit under it has its manifest in the metadata, and again if
+// the tree changes. The servers then serve root/.h9index. Indexing reads
+// metadata only and never faults content in. It fails with
+// h9index.ErrNotReady while a unit under the root is absent or fetching.
+// Single units inside a view (one layer, one store path) don't get one.
+type RootIndexer interface {
+	IndexRoot(ctx context.Context, root string) error
+}

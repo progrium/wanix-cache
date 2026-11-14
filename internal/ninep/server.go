@@ -30,7 +30,7 @@ type Node struct {
 	Mode    fs.FileMode // permission bits
 	Size    int64
 	Mtime   time.Time
-	Version uint32 // changes when a file's contents change
+	Version uint32 // qid.vers; 0 for the cache's trees, which never change in place
 }
 
 // Entry is a named Node in a directory listing.
@@ -62,13 +62,24 @@ type Server struct {
 	FS FS
 	// MaxMsize caps the negotiated message size. Default 1 MiB + header.
 	MaxMsize uint32
-	// User is reported as the owner of every file. Default "cache".
+	// User is reported as the owner of every file. Default DefaultUser.
 	User string
 	// Logf, if set, receives connection-level errors.
 	Logf func(format string, args ...any)
 }
 
 const dirPage = 256
+
+// DefaultUser owns every file when Server.User is empty.
+const DefaultUser = "cache"
+
+// UserOrDefault returns user, or DefaultUser if it is empty.
+func UserOrDefault(user string) string {
+	if user == "" {
+		return DefaultUser
+	}
+	return user
+}
 
 func (s *Server) logf(format string, args ...any) {
 	if s.Logf != nil {
@@ -102,6 +113,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 type fid struct {
 	mu   sync.Mutex
+	root uint64 // inode of the attach root; ".." stops there
 	node Node
 	name string
 	open bool
@@ -259,7 +271,8 @@ func (c *conn) addFid(id uint32, f *fid) error {
 	return nil
 }
 
-func qid(n Node) plan9.Qid {
+// Qid is the qid the server reports for n.
+func Qid(n Node) plan9.Qid {
 	q := plan9.Qid{Path: n.Ino, Vers: n.Version, Type: plan9.QTFILE}
 	if n.Dir {
 		q.Type = plan9.QTDIR
@@ -272,14 +285,14 @@ func (c *conn) handle(tx *plan9.Fcall) *plan9.Fcall {
 	case plan9.Tauth:
 		return rerror(errors.New("authentication not required"))
 	case plan9.Tattach:
-		root, err := c.s.FS.Root(c.ctx)
+		root, name, err := c.attachRoot(tx.Aname)
 		if err != nil {
 			return rerror(err)
 		}
-		if err := c.addFid(tx.Fid, &fid{node: root, name: "/"}); err != nil {
+		if err := c.addFid(tx.Fid, &fid{root: root.Ino, node: root, name: name}); err != nil {
 			return rerror(err)
 		}
-		return &plan9.Fcall{Type: plan9.Rattach, Qid: qid(root)}
+		return &plan9.Fcall{Type: plan9.Rattach, Qid: Qid(root)}
 	case plan9.Twalk:
 		return c.walk(tx)
 	case plan9.Topen:
@@ -322,6 +335,36 @@ func (c *conn) handle(tx *plan9.Fcall) *plan9.Fcall {
 	return rerror(errors.New("unsupported message"))
 }
 
+// attachRoot resolves an attach name to the directory it selects. The
+// attach name is a slash-separated path into the namespace ("local/alpine",
+// "/oci/x/rootfs"); empty selects the whole namespace.
+func (c *conn) attachRoot(aname string) (Node, string, error) {
+	cur, err := c.s.FS.Root(c.ctx)
+	if err != nil {
+		return Node{}, "", err
+	}
+	name := "/"
+	for _, w := range strings.Split(aname, "/") {
+		switch w {
+		case "", ".":
+			continue
+		case "..":
+			return Node{}, "", errors.New("attach name may not contain ..")
+		}
+		if !cur.Dir {
+			return Node{}, "", errNotDir
+		}
+		if cur, err = c.s.FS.Lookup(c.ctx, cur, w); err != nil {
+			return Node{}, "", err
+		}
+		name = w
+	}
+	if !cur.Dir {
+		return Node{}, "", errNotDir
+	}
+	return cur, name, nil
+}
+
 func (c *conn) walk(tx *plan9.Fcall) *plan9.Fcall {
 	f, err := c.getFid(tx.Fid)
 	if err != nil {
@@ -335,7 +378,7 @@ func (c *conn) walk(tx *plan9.Fcall) *plan9.Fcall {
 		f.mu.Unlock()
 		return rerror(errOpen)
 	}
-	cur, name := f.node, f.name
+	cur, name, root := f.node, f.name, f.root
 	f.mu.Unlock()
 
 	qids := make([]plan9.Qid, 0, len(tx.Wname))
@@ -349,7 +392,11 @@ func (c *conn) walk(tx *plan9.Fcall) *plan9.Fcall {
 		case ".":
 			next = cur
 		case "..":
-			next, err = c.s.FS.Parent(c.ctx, cur)
+			if cur.Ino == root {
+				next = cur
+			} else {
+				next, err = c.s.FS.Parent(c.ctx, cur)
+			}
 		default:
 			next, err = c.s.FS.Lookup(c.ctx, cur, w)
 		}
@@ -357,7 +404,7 @@ func (c *conn) walk(tx *plan9.Fcall) *plan9.Fcall {
 			break
 		}
 		cur, name = next, w
-		qids = append(qids, qid(cur))
+		qids = append(qids, Qid(cur))
 	}
 	if len(qids) < len(tx.Wname) {
 		if len(qids) == 0 {
@@ -365,7 +412,7 @@ func (c *conn) walk(tx *plan9.Fcall) *plan9.Fcall {
 		}
 		return &plan9.Fcall{Type: plan9.Rwalk, Wqid: qids}
 	}
-	nf := &fid{node: cur, name: name}
+	nf := &fid{root: root, node: cur, name: name}
 	if tx.Newfid == tx.Fid {
 		c.mu.Lock()
 		c.fids[tx.Fid] = nf
@@ -397,7 +444,7 @@ func (c *conn) open(tx *plan9.Fcall) *plan9.Fcall {
 		f.file = file
 	}
 	f.open = true
-	return &plan9.Fcall{Type: plan9.Ropen, Qid: qid(f.node), Iounit: c.msize - plan9.IOHDRSZ}
+	return &plan9.Fcall{Type: plan9.Ropen, Qid: Qid(f.node), Iounit: c.msize - plan9.IOHDRSZ}
 }
 
 func (c *conn) read(tx *plan9.Fcall) *plan9.Fcall {
@@ -470,18 +517,22 @@ func (c *conn) readDir(f *fid, off uint64, count uint32) ([]byte, error) {
 }
 
 func (c *conn) stat(name string, n Node) ([]byte, error) {
-	user := c.s.User
-	if user == "" {
-		user = "cache"
-	}
+	d := Stat(name, n, c.s.User)
+	return d.Bytes()
+}
+
+// Stat is the directory entry the server reports for n: the reply to Tstat
+// and each record of a directory read. h9index builds its lines from it so
+// an index can't disagree with the server.
+func Stat(name string, n Node, user string) plan9.Dir {
+	user = UserOrDefault(user)
 	mode := plan9.Perm(n.Mode.Perm())
 	if n.Dir {
 		mode |= plan9.DMDIR
 	}
 	mt := uint32(n.Mtime.Unix())
-	d := plan9.Dir{Qid: qid(n), Mode: mode, Atime: mt, Mtime: mt, Length: uint64(n.Size),
+	return plan9.Dir{Qid: Qid(n), Mode: mode, Atime: mt, Mtime: mt, Length: uint64(n.Size),
 		Name: name, Uid: user, Gid: user, Muid: user}
-	return d.Bytes()
 }
 
 // Logger adapts the standard logger for Server.Logf.

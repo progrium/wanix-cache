@@ -3,7 +3,6 @@ package tree
 import (
 	"context"
 	"errors"
-	"hash/fnv"
 	"io"
 	"sync"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/hugelgupf/p9/p9"
 
 	"github.com/progrium/wanix-cache/internal/cas"
+	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
 )
 
@@ -40,8 +40,9 @@ type lnode struct {
 	templatefs.NotLockable
 	templatefs.NoopRenamed
 
-	fs *FS
-	in meta.Inode
+	fs  *FS
+	in  meta.Inode
+	idx *h9index.File // set for a root's generated /.h9index
 
 	mu   sync.Mutex
 	file cas.File // open regular file
@@ -65,6 +66,8 @@ func errno(err error) error {
 	return linux.EIO
 }
 
+// lqid is the 9P2000.L qid of an inode. Its version is 0, as over plain
+// 9P2000: unit trees never change in place.
 func lqid(in meta.Inode) p9.QID {
 	q := p9.QID{Path: in.Ino, Type: p9.TypeRegular}
 	switch in.Kind {
@@ -72,14 +75,28 @@ func lqid(in meta.Inode) p9.QID {
 		q.Type = p9.TypeDir
 	case meta.KindSymlink:
 		q.Type = p9.TypeSymlink
-	case meta.KindFile:
-		if in.Content != "" {
-			h := fnv.New32a()
-			io.WriteString(h, in.Content)
-			q.Version = h.Sum32()
-		}
 	}
 	return q
+}
+
+func (n *lnode) qid() p9.QID {
+	if n.idx != nil {
+		return p9.QID{Path: n.idx.Ino, Version: n.idx.Vers, Type: p9.TypeRegular}
+	}
+	return lqid(n.in)
+}
+
+// lvisible reports whether the 9P2000.L server shows an inode.
+func lvisible(in meta.Inode) bool { return in.Kind != meta.KindWhiteout }
+
+// indexNode returns dir's generated /.h9index, if it has one.
+func (n *lnode) indexNode(ctx context.Context, dir uint64) (*lnode, bool, error) {
+	x, ok, err := n.fs.indexFile(ctx, dir, h9index.DotL)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	in := meta.Inode{Ino: x.Ino, Kind: meta.KindFile, Mode: 0o444, Size: x.Size, Mtime: x.Mtime}
+	return &lnode{fs: n.fs, in: in, idx: &x}, true, nil
 }
 
 func lmode(in meta.Inode) p9.FileMode {
@@ -96,13 +113,23 @@ func lmode(in meta.Inode) p9.FileMode {
 func (n *lnode) Walk(names []string) ([]p9.QID, p9.File, error) {
 	ctx := context.Background()
 	cur := n.in
+	var idx *lnode
 	qids := make([]p9.QID, 0, len(names))
 	for _, name := range names {
-		if cur.Kind != meta.KindDir {
+		if cur.Kind != meta.KindDir || idx != nil {
 			return nil, nil, linux.ENOTDIR
 		}
 		var next meta.Inode
 		var err error
+		if name == h9index.Name {
+			var ok bool
+			if idx, ok, err = n.indexNode(ctx, cur.Ino); err != nil {
+				return nil, nil, errno(err)
+			} else if ok {
+				qids = append(qids, idx.qid())
+				continue
+			}
+		}
 		if name == ".." {
 			next, err = n.fs.Meta.Get(ctx, cur.Parent)
 		} else {
@@ -117,11 +144,14 @@ func (n *lnode) Walk(names []string) ([]p9.QID, p9.File, error) {
 		cur = next
 		qids = append(qids, lqid(cur))
 	}
+	if idx != nil {
+		return qids, idx, nil
+	}
 	return qids, &lnode{fs: n.fs, in: cur}, nil
 }
 
-func (n *lnode) GetAttr(req p9.AttrMask) (p9.QID, p9.AttrMask, p9.Attr, error) {
-	in := n.in
+// lattr is the 9P2000.L attributes of an inode, except its link count.
+func lattr(in meta.Inode) p9.Attr {
 	a := p9.Attr{
 		Mode:             lmode(in),
 		NLink:            1,
@@ -137,7 +167,14 @@ func (n *lnode) GetAttr(req p9.AttrMask) (p9.QID, p9.AttrMask, p9.Attr, error) {
 	}
 	if in.Kind == meta.KindDir {
 		a.NLink, a.Size, a.Blocks = 2, 4096, 8
-	} else if req.NLink {
+	}
+	return a
+}
+
+func (n *lnode) GetAttr(req p9.AttrMask) (p9.QID, p9.AttrMask, p9.Attr, error) {
+	in := n.in
+	a := lattr(in)
+	if in.Kind != meta.KindDir && n.idx == nil && req.NLink {
 		nl, err := n.fs.Meta.Nlink(context.Background(), in.Ino)
 		if err != nil {
 			return p9.QID{}, p9.AttrMask{}, p9.Attr{}, linux.EIO
@@ -146,7 +183,7 @@ func (n *lnode) GetAttr(req p9.AttrMask) (p9.QID, p9.AttrMask, p9.Attr, error) {
 	}
 	valid := p9.AttrMask{Mode: true, NLink: true, UID: true, GID: true, Size: true,
 		Blocks: true, ATime: true, MTime: true, CTime: true}
-	return lqid(in), valid, a, nil
+	return n.qid(), valid, a, nil
 }
 
 func (n *lnode) StatFS() (p9.FSStat, error) {
@@ -168,8 +205,16 @@ func (n *lnode) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 	if mode.Mode() != p9.ReadOnly {
 		return p9.QID{}, 0, linux.EROFS
 	}
-	switch n.in.Kind {
-	case meta.KindFile:
+	switch {
+	case n.idx != nil:
+		f, err := n.fs.openIndex(context.Background(), n.idx.Ino)
+		if err != nil {
+			return p9.QID{}, 0, errno(err)
+		}
+		n.mu.Lock()
+		n.file = f
+		n.mu.Unlock()
+	case n.in.Kind == meta.KindFile:
 		// Re-read: the walk may predate an ingest or a refault.
 		in, err := n.fs.Meta.Get(context.Background(), n.in.Ino)
 		if err != nil {
@@ -183,10 +228,10 @@ func (n *lnode) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 		n.mu.Lock()
 		n.file = f
 		n.mu.Unlock()
-	case meta.KindSymlink:
+	case n.in.Kind == meta.KindSymlink:
 		return p9.QID{}, 0, linux.ELOOP
 	}
-	return lqid(n.in), 0, nil
+	return n.qid(), 0, nil
 }
 
 func (n *lnode) ReadAt(p []byte, off int64) (int, error) {
@@ -213,6 +258,35 @@ func (n *lnode) Readdir(offset uint64, count uint32) (p9.Dirents, error) {
 		return nil, linux.ENOTDIR
 	}
 	ctx := context.Background()
+	// An indexed directory lists its /.h9index first, at offset 0, so the
+	// real entries' offsets are their positions plus one. 9P2000.L
+	// readdir has no order to keep.
+	var out p9.Dirents
+	var shift uint64
+	idx, indexed, err := n.indexNode(ctx, n.in.Ino)
+	if err != nil {
+		return nil, linux.EIO
+	}
+	const direntFixed = 13 + 8 + 1 + 2
+	if indexed {
+		shift = 1
+		if offset == 0 {
+			if int(count) < direntFixed+len(h9index.Name) {
+				return nil, nil
+			}
+			q := idx.qid()
+			out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: h9index.Name, Offset: 1})
+			count -= uint32(direntFixed + len(h9index.Name))
+			offset = 1
+		}
+	}
+	rest, err := n.readdir(ctx, offset-shift, count, shift, indexed)
+	return append(out, rest...), err
+}
+
+// readdir lists real entries from position offset; served offsets are
+// positions plus shift.
+func (n *lnode) readdir(ctx context.Context, offset uint64, count uint32, shift uint64, hideIndex bool) (p9.Dirents, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	// count is the reply size in bytes. An encoded dirent is a 13-byte qid,
@@ -240,13 +314,13 @@ func (n *lnode) Readdir(offset uint64, count uint32) (p9.Dirents, error) {
 	out := make(p9.Dirents, 0, len(des))
 	size, used := 0, 0
 	for i, de := range des {
-		if de.Kind != meta.KindWhiteout {
+		if lvisible(de.Inode) && !(hideIndex && de.Name == h9index.Name) {
 			size += direntFixed + len(de.Name)
 			if size > int(count) {
 				break
 			}
 			q := lqid(de.Inode)
-			out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: de.Name, Offset: offset + uint64(i) + 1})
+			out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: de.Name, Offset: offset + uint64(i) + 1 + shift})
 		}
 		used = i + 1
 	}
@@ -258,7 +332,7 @@ func (n *lnode) Readdir(offset uint64, count uint32) (p9.Dirents, error) {
 		// listing, so read on.
 		n.mu.Unlock()
 		defer n.mu.Lock()
-		return n.Readdir(offset+uint64(used), count)
+		return n.readdir(ctx, offset+uint64(used), count, shift, hideIndex)
 	}
 	return out, nil
 }

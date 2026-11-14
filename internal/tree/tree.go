@@ -3,12 +3,13 @@
 package tree
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"hash/fnv"
 	"io"
 
 	"github.com/progrium/wanix-cache/internal/cas"
+	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
 )
@@ -32,6 +33,10 @@ type FS struct {
 	Faults interface {
 		Miss(ctx context.Context, dir, name string) (bool, error)
 	}
+	// Index, if set, serves generated indexes: each indexed root directory
+	// has a read-only /.h9index, the variant for the server's transport.
+	// It shadows a real file of that name.
+	Index *h9index.Store
 }
 
 // lookup finds name in dir, faulting in a unit on a miss.
@@ -67,13 +72,12 @@ func (f *FS) open(ctx context.Context, in meta.Inode) (cas.File, error) {
 
 var _ ninep.FS = (*FS)(nil)
 
+// node is how the 9P2000 server sees an inode. qid.vers is 0: a unit's
+// tree never changes in place (refetching produces the same tree), and a
+// version taken from the CAS ref would change when ingest sets the ref,
+// which h9's index layer would see as a stale file.
 func node(in meta.Inode) ninep.Node {
 	n := ninep.Node{Ino: in.Ino, Dir: in.Kind == meta.KindDir, Mode: in.Mode, Size: in.Size, Mtime: in.Mtime}
-	if in.Kind == meta.KindFile && in.Content != "" {
-		h := fnv.New32a()
-		io.WriteString(h, in.Content)
-		n.Version = h.Sum32()
-	}
 	if n.Dir {
 		n.Size = 0
 	}
@@ -97,6 +101,11 @@ func (f *FS) Parent(ctx context.Context, dir ninep.Node) (ninep.Node, error) {
 }
 
 func (f *FS) Lookup(ctx context.Context, dir ninep.Node, name string) (ninep.Node, error) {
+	if name == h9index.Name {
+		if x, ok, err := f.indexFile(ctx, dir.Ino, h9index.NineP); err != nil || ok {
+			return indexNode(x), err
+		}
+	}
 	in, err := f.lookup(ctx, dir.Ino, name)
 	if err != nil {
 		return ninep.Node{}, err
@@ -112,17 +121,70 @@ func (f *FS) ReadDir(ctx context.Context, dir ninep.Node, after string, limit in
 	if err != nil {
 		return nil, after, false, err
 	}
-	out := make([]ninep.Entry, 0, len(des))
+	done := len(des) < limit
+	// An indexed directory lists its /.h9index in name order, so the
+	// name cursor stays valid: it goes in the page whose range covers it.
+	var x h9index.File
+	var indexed bool
+	if after < h9index.Name && (done || des[len(des)-1].Name >= h9index.Name) {
+		if x, indexed, err = f.indexFile(ctx, dir.Ino, h9index.NineP); err != nil {
+			return nil, after, false, err
+		}
+	}
+	shadow := indexed
+	out := make([]ninep.Entry, 0, len(des)+1)
 	for _, de := range des {
+		if indexed && de.Name >= h9index.Name {
+			out = append(out, ninep.Entry{Name: h9index.Name, Node: indexNode(x)})
+			indexed = false
+		}
 		after = de.Name
+		if de.Name == h9index.Name && shadow {
+			continue // shadowed by the generated index
+		}
 		if visible(de.Inode) {
 			out = append(out, ninep.Entry{Name: de.Name, Node: node(de.Inode)})
 		}
 	}
-	return out, after, len(des) < limit, nil
+	if indexed {
+		out = append(out, ninep.Entry{Name: h9index.Name, Node: indexNode(x)})
+	}
+	return out, after, done, nil
 }
 
+// indexFile returns dir's generated index for variant v, if it has one.
+func (f *FS) indexFile(ctx context.Context, dir uint64, v h9index.Variant) (h9index.File, bool, error) {
+	if f.Index == nil {
+		return h9index.File{}, false, nil
+	}
+	return f.Index.Get(ctx, dir, v)
+}
+
+func indexNode(x h9index.File) ninep.Node {
+	return ninep.Node{Ino: x.Ino, Mode: 0o444, Size: x.Size, Mtime: x.Mtime, Version: x.Vers}
+}
+
+// openIndex returns the bytes of the index file numbered ino.
+func (f *FS) openIndex(ctx context.Context, ino uint64) (cas.File, error) {
+	dir, v, _ := h9index.IsFileIno(ino)
+	if f.Index == nil {
+		return nil, meta.ErrNotExist
+	}
+	b, err := f.Index.Read(ctx, dir, v)
+	if err != nil {
+		return nil, err
+	}
+	return bytesFile{bytes.NewReader(b)}, nil
+}
+
+type bytesFile struct{ *bytes.Reader }
+
+func (bytesFile) Close() error { return nil }
+
 func (f *FS) Open(ctx context.Context, n ninep.Node) (ninep.File, error) {
+	if _, _, ok := h9index.IsFileIno(n.Ino); ok {
+		return f.openIndex(ctx, n.Ino)
+	}
 	in, err := f.Meta.Get(ctx, n.Ino)
 	if err != nil {
 		return nil, err

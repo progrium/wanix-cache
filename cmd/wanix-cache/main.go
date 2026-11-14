@@ -2,6 +2,7 @@
 //
 //	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR]
 //	wanix-cache import [-data DIR] [-max-gib N] -key NAME SRC
+//	wanix-cache index  [-data DIR] [-all] [ROOT...]
 //	wanix-cache stats  [-data DIR]
 //	wanix-cache units  [-data DIR] [-subsystem NAME]
 //	wanix-cache gc     [-data DIR] [-max-gib N] [-high F] [-low F]
@@ -27,9 +28,11 @@ import (
 	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/gc"
+	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
+	"github.com/progrium/wanix-cache/internal/subsys"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
 
@@ -39,6 +42,7 @@ func usage() {
 commands:
   serve    serve the cache read-only over 9P2000.L (and optionally plain 9P2000)
   import   import a local directory as a unit under /local/<key>
+  index    generate the /.h9index of roots (such as /local/alpine)
   stats    print store totals
   units    list units
   gc       sweep unreferenced blobs and evict down to the low watermark
@@ -75,6 +79,13 @@ func main() {
 			log.Fatal("import: need exactly one source directory")
 		}
 		err = importDir(*data, *key, fl.Arg(0), *gib<<30)
+	case "index":
+		all := fl.Bool("all", false, "regenerate every root that already has an index")
+		fl.Parse(args)
+		if !*all && fl.NArg() == 0 {
+			log.Fatal("index: need a root path (such as /local/alpine) or -all")
+		}
+		err = indexRoots(*data, *all, fl.Args())
 	case "stats":
 		fl.Parse(args)
 		err = stats(*data)
@@ -127,13 +138,18 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 		return err
 	}
 	defer mgr.Close()
+	idx, err := h9index.Open(context.Background(), db)
+	if err != nil {
+		return err
+	}
+	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr, Index: idx}
+	rootIndexer = fs.Indexer(idx, "")
 	if err := registerSubsystems(context.Background(), mgr, dir); err != nil {
 		return err
 	}
 	if err := startGC(db, store, mgr, quota, max); err != nil {
 		return err
 	}
-	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr}
 	errc := make(chan error, 2)
 	if addrL != "" {
 		ln, err := net.Listen("tcp", addrL)
@@ -193,6 +209,74 @@ func importDir(dir, key, src string, quota int64) error {
 	fmt.Printf("logical %s, new CAS bytes %s (%d new content objects), %v (%.1f MiB/s)\n",
 		size(res.LogicalBytes), size(after-before), res.NewContents, el.Round(time.Millisecond),
 		float64(res.LogicalBytes)/(1<<20)/el.Seconds())
+	ix, err := indexer(db, store)
+	if err != nil {
+		return err
+	}
+	r, err := ix.Index(context.Background(), "/local/"+key)
+	if err != nil {
+		return err
+	}
+	printIndex(r)
+	return nil
+}
+
+// rootIndexer is the h9index hook while serving. It is set before
+// registerSubsystems runs, so a subsystem's register function can hand it
+// to the subsystem (subsys.RootIndexer).
+var rootIndexer subsys.RootIndexer
+
+// indexer returns an h9index generator over the metadata, for commands
+// that run without the server.
+func indexer(db *meta.DB, store *cas.Store) (*h9index.Indexer, error) {
+	idx, err := h9index.Open(context.Background(), db)
+	if err != nil {
+		return nil, err
+	}
+	fs := &tree.FS{Meta: db, CAS: store, Index: idx}
+	return fs.Indexer(idx, ""), nil
+}
+
+func printIndex(r h9index.Result) {
+	for _, v := range h9index.Variants {
+		st, ok := r.Stats[v]
+		if !ok {
+			continue
+		}
+		fmt.Printf("indexed %s/%s (%s): %d entries, %d dirs, %d unindexed, %s\n",
+			r.Root, h9index.Name, v, st.Entries, st.Dirs, st.Unindexed, size(int64(st.Bytes)))
+	}
+}
+
+// indexRoots generates /.h9index for the given roots, or with all for
+// every root that already has one.
+func indexRoots(dir string, all bool, roots []string) error {
+	db, store, err := open(dir, 0)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	ix, err := indexer(db, store)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	if all {
+		rs, err := ix.IndexAll(ctx)
+		for _, r := range rs {
+			printIndex(r)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, root := range roots {
+		r, err := ix.Index(ctx, root)
+		if err != nil {
+			return err
+		}
+		printIndex(r)
+	}
 	return nil
 }
 
