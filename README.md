@@ -372,6 +372,9 @@ about 1.7 to 1.0 GiB/s. Blob sizes in `stats` are then stored
 
 ## Measurements (phase 1)
 
+Every performance change, with before and after numbers, is logged in
+[`docs/perf-log.md`](docs/perf-log.md).
+
 - Lookup by `(parent, name)`: 7 µs at 1k entries, 12 µs at 100k entries
   (`go test -v -run LookupScales ./internal/meta`). The prototype's
   `index.json` was 37x slower at 11.6k entries.
