@@ -39,6 +39,10 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hjfreyer/taglib-go v0.0.0-20151027170453-0ef8bba9c41b h1:Q4OOFmH18aIjnDJlvYm4BXmpHKXk1zTJP0QZ0otNwPs=
 github.com/hjfreyer/taglib-go v0.0.0-20151027170453-0ef8bba9c41b/go.mod h1:eSDoUM0WCOj3y5CUX9yQVbMSlGd4YSd/ukmLIhxLZaI=
+github.com/hugelgupf/p9 v0.5.1 h1:u8XodueoFehU/UcJRoTvX4BZVUGZ3rFUx8/PPQy2QYw=
+github.com/hugelgupf/p9 v0.5.1/go.mod h1:+3Q9CRwDxOVMp/EHmef0ZQ8KMEkBrutei+dMScb0UWw=
+github.com/hugelgupf/socketpair v0.0.0-20230822150718-707395b1939a h1:Nq7wDsqsVBUBfGn8yB1M028ShWTKTtZBcafaTJ35N0s=
+github.com/hugelgupf/socketpair v0.0.0-20230822150718-707395b1939a/go.mod h1:71Bqb5Fh9zPHF8jwdmMEmJObzr25Mx5pWLbDBMMEn6E=
 github.com/jonas-p/go-shp v0.1.1 h1:LY81nN67DBCz6VNFn2kS64CjmnDo9IP8rmSkTvhO9jE=
 github.com/jonas-p/go-shp v0.1.1/go.mod h1:MRIhyxDQ6VVp0oYeD7yPGr5RSTNScUFKCDsI5DR7PtI=
 github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8BSWMRd47J3Lbz7vsReI=
@@ -55,6 +59,8 @@ github.com/syndtr/goleveldb v1.0.1-0.20220721030215-126854af5e6d h1:vfofYNRScrDd
 github.com/syndtr/goleveldb v1.0.1-0.20220721030215-126854af5e6d/go.mod h1:RRCYJbIwD5jmqPI9XoAFR0OcDxqUctll6zUj/+B4S48=
 github.com/tetratelabs/wazero v1.12.0 h1:DuWcpNu/FzgEXgGBDp8J1Spc+CWOvvtvVyjKlaZopYU=
 github.com/tetratelabs/wazero v1.12.0/go.mod h1:LvKtzl2RqO4gyF27BiXU+nKAjcV8f38U+kP/q2vgxh0=
+github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 h1:pyC9PaHYZFgEKFdlp3G8RaCKgVpHZnecvArXvPXcFkM=
+github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701/go.mod h1:P3a5rG4X7tI17Nn3aOIAYr5HbIMukwXG0urG0WuL8OA=
 go4.org v0.0.0-20261028031214-ed6929a230fe h1:yfndMMSDkqz8+DrOJg5ntgSWVjqA8J29ohDg/ePjPPY=
 go4.org v0.0.0-20261028031214-ed6929a230fe/go.mod h1:ZRJnO5ZI4zAwMFp+dS1+V6J6MSyAowhRqAE+DPa1Xp0=
 go4.org/mem v0.0.0-20240501181205-ae6ca9944745 h1:Tl++JLUCe4sxGu8cTpDzRLd3tN7US4hOxG5YpKCzkek=

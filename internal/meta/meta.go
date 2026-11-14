@@ -218,3 +218,34 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 		Scan(&s.Inodes, &s.Units, &s.Contents, &s.ContentBytes, &s.FileBytes)
 	return s, err
 }
+
+// ReadDirAt lists up to limit entries of directory dir, skipping the first
+// skip entries in name order. It serves clients whose directory cursors are
+// positions rather than names (9P2000.L readdir offsets).
+func (d *DB) ReadDirAt(ctx context.Context, dir uint64, skip uint64, limit int) ([]Dirent, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT d.name, i.ino, i.kind, i.mode, i.size, i.mtime, i.content, i.target, i.parent, i.unit
+		FROM dirent d JOIN inode i ON i.ino = d.ino
+		WHERE d.parent = ? ORDER BY d.name LIMIT ? OFFSET ?`, dir, limit, skip)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Dirent
+	for rows.Next() {
+		var de Dirent
+		in, err := scanInode(rows, &de.Name)
+		if err != nil {
+			return nil, err
+		}
+		de.Inode = in
+		out = append(out, de)
+	}
+	return out, rows.Err()
+}
+
+// Nlink returns the number of directory entries that name an inode.
+func (d *DB) Nlink(ctx context.Context, ino uint64) (uint64, error) {
+	var n uint64
+	err := d.db.QueryRowContext(ctx, `SELECT count(*) FROM dirent WHERE ino = ?`, ino).Scan(&n)
+	return n, err
+}

@@ -1,6 +1,6 @@
 // Command wanix-cache is the H9 read-through cache.
 //
-//	wanix-cache serve  [-data DIR] [-9p ADDR]
+//	wanix-cache serve  [-data DIR] [-9p ADDR] [-9p2000 ADDR]
 //	wanix-cache import [-data DIR] [-max-gib N] -key NAME SRC
 //	wanix-cache stats  [-data DIR]
 //	wanix-cache units  [-data DIR] [-subsystem NAME]
@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,7 +30,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: wanix-cache <command> [flags]
 
 commands:
-  serve    serve the cache read-only over 9P2000
+  serve    serve the cache read-only over 9P2000.L (and optionally plain 9P2000)
   import   import a local directory as a unit under /local/<key>
   stats    print store totals
   units    list units`)
@@ -47,9 +48,10 @@ func main() {
 	var err error
 	switch cmd {
 	case "serve":
-		addr := fl.String("9p", "127.0.0.1:5640", "9P2000 TCP listen address")
+		addrL := fl.String("9p", "127.0.0.1:5640", "9P2000.L TCP listen address (Linux guests); empty to disable")
+		addr := fl.String("9p2000", "", "plain 9P2000 TCP listen address (no symlinks); empty to disable")
 		fl.Parse(args)
-		err = serve(*data, *addr)
+		err = serve(*data, *addrL, *addr)
 	case "import":
 		key := fl.String("key", "", "unit key (defaults to the source directory's name)")
 		gib := fl.Int64("max-gib", 0, "quota on unique CAS bytes, GiB; 0 = unlimited")
@@ -89,13 +91,34 @@ func open(dir string, quota int64) (*meta.DB, *cas.Store, error) {
 	return db, store, nil
 }
 
-func serve(dir, addr string) error {
+func serve(dir, addrL, addr string) error {
+	if addrL == "" && addr == "" {
+		return fmt.Errorf("serve: no listen address")
+	}
 	db, store, err := open(dir, 0)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	srv := &ninep.Server{FS: &tree.FS{Meta: db, CAS: store}, Logf: log.Printf}
+	fs := &tree.FS{Meta: db, CAS: store}
+	errc := make(chan error, 2)
+	if addrL != "" {
+		ln, err := net.Listen("tcp", addrL)
+		if err != nil {
+			return err
+		}
+		log.Printf("serving %s read-only over 9P2000.L on %s", dir, ln.Addr())
+		go func() { errc <- tree.NewDotLServer(fs).Serve(ln) }()
+	}
+	if addr != "" {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		log.Printf("serving %s read-only over 9P2000 on %s", dir, ln.Addr())
+		srv := &ninep.Server{FS: fs, Logf: log.Printf}
+		go func() { errc <- srv.Serve(ln) }()
+	}
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -103,8 +126,7 @@ func serve(dir, addr string) error {
 		db.Close()
 		os.Exit(0)
 	}()
-	log.Printf("serving %s read-only over 9P2000 on %s", dir, addr)
-	return srv.ListenAndServe(addr)
+	return <-errc
 }
 
 func importDir(dir, key, src string, quota int64) error {
