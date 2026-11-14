@@ -52,6 +52,10 @@ type Info struct {
 	// Name and Version, for package-aware subsystems, key the usage history
 	// so it survives eviction and upgrades. Empty for others.
 	Name, Version string
+	// Mount is where the unit's root directory goes, relative to /<sub>/,
+	// slash separated, for example "x86_64/musl-1.2.5-r0". Default: the
+	// key. Resolve must map paths under the mount back to this key.
+	Mount string
 }
 
 // Subsystem is implemented by each subsystem package.

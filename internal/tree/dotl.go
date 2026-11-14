@@ -106,7 +106,7 @@ func (n *lnode) Walk(names []string) ([]p9.QID, p9.File, error) {
 		if name == ".." {
 			next, err = n.fs.Meta.Get(ctx, cur.Parent)
 		} else {
-			next, err = n.fs.Meta.Lookup(ctx, cur.Ino, name)
+			next, err = n.fs.lookup(ctx, cur.Ino, name)
 		}
 		if err != nil {
 			return nil, nil, errno(err)
@@ -170,14 +170,15 @@ func (n *lnode) Open(mode p9.OpenFlags) (p9.QID, uint32, error) {
 	}
 	switch n.in.Kind {
 	case meta.KindFile:
-		var f cas.File
-		if n.in.Content == "" {
-			f = emptyFile{}
-		} else {
-			var err error
-			if f, err = n.fs.CAS.Open(context.Background(), n.in.Content); err != nil {
-				return p9.QID{}, 0, linux.EIO
-			}
+		// Re-read: the walk may predate an ingest or a refault.
+		in, err := n.fs.Meta.Get(context.Background(), n.in.Ino)
+		if err != nil {
+			return p9.QID{}, 0, errno(err)
+		}
+		n.in = in
+		f, err := n.fs.open(context.Background(), in)
+		if err != nil {
+			return p9.QID{}, 0, errno(err)
 		}
 		n.mu.Lock()
 		n.file = f
@@ -281,14 +282,14 @@ func (n *lnode) Close() error {
 
 // Everything below changes the tree, and the tree is read-only to clients.
 
-func (*lnode) WriteAt([]byte, int64) (int, error)              { return 0, linux.EROFS }
-func (*lnode) FSync() error                                     { return linux.EROFS }
-func (*lnode) SetAttr(p9.SetAttrMask, p9.SetAttr) error         { return linux.EROFS }
-func (*lnode) Remove() error                                    { return linux.EROFS }
-func (*lnode) Rename(p9.File, string) error                     { return linux.EROFS }
-func (*lnode) RenameAt(string, p9.File, string) error           { return linux.EROFS }
-func (*lnode) UnlinkAt(string, uint32) error                    { return linux.EROFS }
-func (*lnode) Link(p9.File, string) error                       { return linux.EROFS }
+func (*lnode) WriteAt([]byte, int64) (int, error)       { return 0, linux.EROFS }
+func (*lnode) FSync() error                             { return linux.EROFS }
+func (*lnode) SetAttr(p9.SetAttrMask, p9.SetAttr) error { return linux.EROFS }
+func (*lnode) Remove() error                            { return linux.EROFS }
+func (*lnode) Rename(p9.File, string) error             { return linux.EROFS }
+func (*lnode) RenameAt(string, p9.File, string) error   { return linux.EROFS }
+func (*lnode) UnlinkAt(string, uint32) error            { return linux.EROFS }
+func (*lnode) Link(p9.File, string) error               { return linux.EROFS }
 func (*lnode) Mkdir(string, p9.FileMode, p9.UID, p9.GID) (p9.QID, error) {
 	return p9.QID{}, linux.EROFS
 }

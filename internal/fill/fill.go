@@ -53,6 +53,16 @@ type Manager interface {
 	// resident. An open handle pins the unit until Close.
 	Open(ctx context.Context, in meta.Inode) (cas.File, error)
 
+	// OpenPath opens the file at rel (slash separated, inside the unit) of a
+	// unit, faulting the unit in and waiting for the entry if needed. For
+	// frontends that are not the 9P tree, such as the APK HTTP mirror.
+	OpenPath(ctx context.Context, sub string, key subsys.Key, rel string) (cas.File, meta.Inode, error)
+
+	// WatchOpens registers fn to be called when a file is opened through
+	// Open or OpenPath and again when it is closed, for usage tracking. It
+	// runs on the opening goroutine, so it must be cheap.
+	WatchOpens(fn func(OpenEvent))
+
 	// Acquire pins a unit against eviction until release is called. Views
 	// pin their units; fills and open handles pin implicitly.
 	Acquire(unitID int64) (release func())
@@ -72,6 +82,14 @@ type UnitEvent struct {
 	Unit     meta.Unit
 	From, To meta.UnitState
 	Err      error // set when a fill failed
+}
+
+// OpenEvent describes a file open (Closed false) or close (Closed true,
+// with the bytes read through that handle).
+type OpenEvent struct {
+	Inode     meta.Inode
+	Closed    bool
+	BytesRead int64
 }
 
 // Reclaimer frees CAS bytes by evicting units. The Manager calls it when a

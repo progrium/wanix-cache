@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/progrium/wanix-cache/internal/cas"
+	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/ingest"
 	"github.com/progrium/wanix-cache/internal/meta"
 	"github.com/progrium/wanix-cache/internal/ninep"
@@ -50,8 +51,10 @@ func main() {
 	case "serve":
 		addrL := fl.String("9p", "127.0.0.1:5640", "9P2000.L TCP listen address (Linux guests); empty to disable")
 		addr := fl.String("9p2000", "", "plain 9P2000 TCP listen address (no symlinks); empty to disable")
+		gib := fl.Int64("max-gib", 10, "cap on CAS + spool bytes, GiB; 0 = unlimited")
+		workers := fl.Int("ingest-workers", 4, "files ingested into the CAS concurrently")
 		fl.Parse(args)
-		err = serve(*data, *addrL, *addr)
+		err = serve(*data, *addrL, *addr, *gib<<30, *workers)
 	case "import":
 		key := fl.String("key", "", "unit key (defaults to the source directory's name)")
 		gib := fl.Int64("max-gib", 0, "quota on unique CAS bytes, GiB; 0 = unlimited")
@@ -91,7 +94,7 @@ func open(dir string, quota int64) (*meta.DB, *cas.Store, error) {
 	return db, store, nil
 }
 
-func serve(dir, addrL, addr string) error {
+func serve(dir, addrL, addr string, max int64, workers int) error {
 	if addrL == "" && addr == "" {
 		return fmt.Errorf("serve: no listen address")
 	}
@@ -100,7 +103,20 @@ func serve(dir, addrL, addr string) error {
 		return err
 	}
 	defer db.Close()
-	fs := &tree.FS{Meta: db, CAS: store}
+	spool, err := fill.OpenDiskSpool(filepath.Join(dir, "spool"))
+	if err != nil {
+		return err
+	}
+	quota := &fill.LocalQuota{Max: max, CAS: func() int64 { u, _ := store.Usage(); return u }, Spool: spool.Bytes}
+	mgr, err := fill.NewManager(db, store, spool, quota, fill.Options{Workers: workers})
+	if err != nil {
+		return err
+	}
+	defer mgr.Close()
+	if err := registerSubsystems(context.Background(), mgr, dir); err != nil {
+		return err
+	}
+	fs := &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr}
 	errc := make(chan error, 2)
 	if addrL != "" {
 		ln, err := net.Listen("tcp", addrL)
@@ -123,6 +139,7 @@ func serve(dir, addrL, addr string) error {
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigs
+		mgr.Close() // spooled units are ingested on the next start
 		db.Close()
 		os.Exit(0)
 	}()

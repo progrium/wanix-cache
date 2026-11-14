@@ -4,6 +4,7 @@ package tree
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"io"
 
@@ -20,6 +21,48 @@ import (
 type FS struct {
 	Meta *meta.DB
 	CAS  *cas.Store
+
+	// Files, if set, opens file bytes in any unit state (the fill path's
+	// spool or the CAS). Without it files are read from the CAS only.
+	Files interface {
+		Open(ctx context.Context, in meta.Inode) (cas.File, error)
+	}
+	// Faults, if set, is told about lookup misses so it can fault in the
+	// unit that holds the name. It reports whether to retry the lookup.
+	Faults interface {
+		Miss(ctx context.Context, dir, name string) (bool, error)
+	}
+}
+
+// lookup finds name in dir, faulting in a unit on a miss.
+func (f *FS) lookup(ctx context.Context, dir uint64, name string) (meta.Inode, error) {
+	in, err := f.Meta.Lookup(ctx, dir, name)
+	if err == nil || f.Faults == nil || !errors.Is(err, meta.ErrNotExist) {
+		return in, err
+	}
+	p, perr := f.Meta.PathOf(ctx, dir)
+	if perr != nil {
+		return in, err
+	}
+	retry, ferr := f.Faults.Miss(ctx, p, name)
+	if ferr != nil {
+		return in, ferr
+	}
+	if !retry {
+		return in, err
+	}
+	return f.Meta.Lookup(ctx, dir, name)
+}
+
+// open returns a file inode's bytes.
+func (f *FS) open(ctx context.Context, in meta.Inode) (cas.File, error) {
+	if f.Files != nil {
+		return f.Files.Open(ctx, in)
+	}
+	if in.Content == "" {
+		return emptyFile{}, nil
+	}
+	return f.CAS.Open(ctx, in.Content)
 }
 
 var _ ninep.FS = (*FS)(nil)
@@ -54,7 +97,7 @@ func (f *FS) Parent(ctx context.Context, dir ninep.Node) (ninep.Node, error) {
 }
 
 func (f *FS) Lookup(ctx context.Context, dir ninep.Node, name string) (ninep.Node, error) {
-	in, err := f.Meta.Lookup(ctx, dir.Ino, name)
+	in, err := f.lookup(ctx, dir.Ino, name)
 	if err != nil {
 		return ninep.Node{}, err
 	}
@@ -84,10 +127,7 @@ func (f *FS) Open(ctx context.Context, n ninep.Node) (ninep.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if in.Content == "" {
-		return emptyFile{}, nil
-	}
-	return f.CAS.Open(ctx, in.Content)
+	return f.open(ctx, in)
 }
 
 type emptyFile struct{}
