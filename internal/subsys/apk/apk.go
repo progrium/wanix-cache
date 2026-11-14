@@ -82,7 +82,7 @@ type APK struct {
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // per-repo index refresh
-	bg    sync.WaitGroup          // background indexing and unpacking
+	bg    sync.WaitGroup         // background indexing and unpacking
 	now   func() time.Time
 }
 
@@ -167,7 +167,88 @@ CREATE TABLE apk_pkg (
 CREATE INDEX apk_pkg_sha1 ON apk_pkg (sha1);
 CREATE INDEX apk_pkg_arch_nv ON apk_pkg (arch, nv, indexed_at);
 `},
+		// Alpine rebuilds some packages per branch without bumping the
+		// version, so one name-version can name several builds. Each build
+		// gets its own directory: the first one mounted keeps <name>-<ver>,
+		// later ones get <name>-<ver>@<sha1 prefix>. Backfilled from units
+		// already mounted at <name>-<ver>.
+		{Version: 2, SQL: `
+CREATE TABLE apk_mount (
+	arch TEXT NOT NULL,
+	dir  TEXT NOT NULL, -- <name>-<ver> or <name>-<ver>@<sha1 prefix>
+	sha1 TEXT NOT NULL,
+	PRIMARY KEY (arch, dir)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX apk_mount_sha1 ON apk_mount (arch, sha1);
+INSERT OR IGNORE INTO apk_mount (arch, dir, sha1)
+	SELECT p.arch, p.nv, p.sha1 FROM unit u
+	JOIN apk_pkg p ON p.sha1 = substr(u.key, 1, 40)
+	WHERE u.subsystem = 'apk' AND u.root != 0
+	GROUP BY p.arch, p.sha1
+	ORDER BY u.id;
+`},
 	}
+}
+
+// mountShaLen is how much of the SHA-1 a disambiguated directory carries.
+const mountShaLen = 12
+
+// mountDir returns the directory under /apk/<arch>/ (and /apk/<arch>/.apk/)
+// for pkg's build, claiming <name>-<ver> if no other build of that
+// name-version has it, else <name>-<ver>@<sha1 prefix>. A build keeps the
+// directory it was first given.
+func (a *APK) mountDir(ctx context.Context, pkg pkgRow) (string, error) {
+	for range 3 {
+		var dir string
+		err := a.sql.QueryRowContext(ctx, `SELECT dir FROM apk_mount WHERE arch = ? AND sha1 = ?`, pkg.Arch, pkg.SHA1).Scan(&dir)
+		if err == nil {
+			return dir, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		for _, d := range []string{pkg.NV, pkg.NV + "@" + pkg.SHA1[:mountShaLen]} {
+			res, err := a.sql.ExecContext(ctx, `INSERT OR IGNORE INTO apk_mount (arch, dir, sha1) VALUES (?, ?, ?)`, pkg.Arch, d, pkg.SHA1)
+			if err != nil {
+				return "", err
+			}
+			if n, _ := res.RowsAffected(); n == 1 {
+				return d, nil
+			}
+		}
+		// Lost a race with a concurrent claim for the same build: read it.
+	}
+	return "", fmt.Errorf("apk: %s: no mount directory", pkg.NV)
+}
+
+// pkgByDir finds the build a directory under /apk/<arch>/ names: the one
+// that claimed it, else for <name>-<ver> the most recently indexed build,
+// and for <name>-<ver>@<prefix> the build with that SHA-1 prefix.
+func (a *APK) pkgByDir(ctx context.Context, arch, dir string) (pkgRow, error) {
+	var sha string
+	err := a.sql.QueryRowContext(ctx, `SELECT sha1 FROM apk_mount WHERE arch = ? AND dir = ?`, arch, dir).Scan(&sha)
+	if err == nil {
+		return a.pkgBySHA1(ctx, sha)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return pkgRow{}, err
+	}
+	nv, prefix, ok := strings.Cut(dir, "@")
+	if !ok {
+		return a.pkgByNV(ctx, arch, nv)
+	}
+	if len(prefix) != mountShaLen || strings.Trim(prefix, "0123456789abcdef") != "" {
+		return pkgRow{}, fs.ErrNotExist
+	}
+	pkg, err := scanPkg(a.sql.QueryRowContext(ctx, `SELECT `+pkgCols+` FROM apk_pkg WHERE arch = ? AND nv = ? AND sha1 LIKE ? ORDER BY indexed_at DESC LIMIT 1`, arch, nv, prefix+"%"))
+	if err != nil {
+		return pkg, err
+	}
+	// Only a build that is (or would be) mounted here resolves here.
+	if d, err := a.mountDir(ctx, pkg); err != nil || d != dir {
+		return pkgRow{}, fs.ErrNotExist
+	}
+	return pkg, nil
 }
 
 // Keys.
@@ -229,7 +310,9 @@ func (a *APK) knownArch(ctx context.Context, arch string) bool {
 //	<arch>/<name>-<ver>/<rel>         unpacked layer
 //	<arch>/.apk/<name>-<ver>/<rel>    raw .apk (rel is <name>-<ver>.apk)
 //
-// for packages in an index the mirror has fetched.
+// for packages in an index the mirror has fetched. When several builds
+// share a name-version (Alpine rebuilds some per branch), the first one
+// mounted keeps <name>-<ver> and the others are <name>-<ver>@<sha1[:12]>.
 func (a *APK) Resolve(ctx context.Context, p string) (subsys.Key, string, error) {
 	parts := strings.SplitN(strings.Trim(p, "/"), "/", 4)
 	arch := parts[0]
@@ -246,12 +329,12 @@ func (a *APK) Resolve(ctx context.Context, p string) (subsys.Key, string, error)
 			return "", "", subsys.ErrDir
 		}
 	}
-	nv := parts[1]
+	dir := parts[1]
 	rel := ""
 	if len(parts) > 2 {
 		rel = strings.Join(parts[2:], "/")
 	}
-	pkg, err := a.pkgByNV(ctx, arch, nv)
+	pkg, err := a.pkgByDir(ctx, arch, dir)
 	if err != nil {
 		return "", "", err
 	}
@@ -276,12 +359,16 @@ func (a *APK) Describe(ctx context.Context, key subsys.Key) (subsys.Info, error)
 		Name:    pkg.Name,
 		Version: pkg.Version,
 	}
+	dir, err := a.mountDir(ctx, pkg)
+	if err != nil {
+		return subsys.Info{}, err
+	}
 	if raw {
 		info.Size = pkg.Size
-		info.Mount = pkg.Arch + "/.apk/" + pkg.NV
+		info.Mount = pkg.Arch + "/.apk/" + dir
 	} else {
 		info.Size = pkg.InstalledSize
-		info.Mount = pkg.Arch + "/" + pkg.NV
+		info.Mount = pkg.Arch + "/" + dir
 	}
 	return info, nil
 }

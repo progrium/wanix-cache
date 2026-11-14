@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/progrium/wanix-cache/internal/fill"
 	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/subsys"
 	"github.com/progrium/wanix-cache/internal/tree"
 )
 
@@ -414,5 +416,73 @@ func TestUnpackAfterMirror(t *testing.T) {
 	}
 	if n := h.up.count("/" + repo + "/" + busybox.nv() + ".apk"); n != 1 {
 		t.Errorf("upstream .apk GETs = %d, want 1", n)
+	}
+}
+
+// Alpine rebuilds some packages per branch without bumping the version:
+// two builds of one name-version must both be servable and get their own
+// layer directories.
+func TestSameVersionTwoBuilds(t *testing.T) {
+	h := newHarness(t, true)
+	ctx := context.Background()
+	const repo2 = "v3.19/main/x86_64"
+	hello2 := (&fixturePkg{name: hello.name, version: hello.version, arch: "x86_64", files: []fixtureEntry{
+		{"usr/", ""},
+		{"usr/bin/", ""},
+		{"usr/bin/hello", "#!/bin/sh\necho hello from 3.19\n"},
+	}}).build()
+	if hello2.sha1hex() == hello.sha1hex() {
+		t.Fatal("fixture builds are identical")
+	}
+	h.up.set("/"+repo2+"/APKINDEX.tar.gz", buildIndex(hello2))
+	h.up.set("/"+repo2+"/"+hello2.nv()+".apk", hello2.apk)
+
+	for _, c := range []struct {
+		repo string
+		pkg  *fixturePkg
+	}{{repo, hello}, {repo2, hello2}} {
+		h.get("/" + c.repo + "/APKINDEX.tar.gz")
+		resp, b := h.get("/" + c.repo + "/" + c.pkg.nv() + ".apk")
+		if resp.StatusCode != http.StatusOK || !bytes.Equal(b, c.pkg.apk) {
+			t.Fatalf("%s: %s, %d bytes", c.repo, resp.Status, len(b))
+		}
+	}
+	h.wait()
+	h.apk.Wait()
+	h.wait()
+
+	want := map[string]string{
+		hello.sha1hex():  "x86_64/" + hello.nv(),
+		hello2.sha1hex(): "x86_64/" + hello2.nv() + "@" + hello2.sha1hex()[:mountShaLen],
+	}
+	for sha, mount := range want {
+		for _, k := range []subsys.Key{rawKey(sha), filesKey(sha)} {
+			info, err := h.apk.Describe(ctx, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := mount
+			if k == rawKey(sha) {
+				m = strings.Replace(mount, "/", "/.apk/", 1)
+			}
+			if info.Mount != m {
+				t.Errorf("%s mount %q, want %q", k, info.Mount, m)
+			}
+			u, err := h.db.Unit(ctx, Name, string(k))
+			if err != nil || u.State != meta.UnitResident {
+				t.Errorf("%s: %+v %v", k, u, err)
+			}
+		}
+		key, rel, err := h.apk.Resolve(ctx, mount+"/usr/bin/hello")
+		if err != nil || key != filesKey(sha) || rel != "usr/bin/hello" {
+			t.Errorf("Resolve(%s) = %s %q %v", mount, key, rel, err)
+		}
+	}
+	// A prefix that names no build, or a build mounted elsewhere, is absent.
+	if _, _, err := h.apk.Resolve(ctx, "x86_64/"+hello.nv()+"@"+hello.sha1hex()[:mountShaLen]); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("first build under a suffixed name: %v", err)
+	}
+	if _, _, err := h.apk.Resolve(ctx, "x86_64/"+hello.nv()+"@000000000000"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("unknown prefix: %v", err)
 	}
 }

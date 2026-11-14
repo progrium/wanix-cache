@@ -176,7 +176,10 @@ directory into the guest.
   `/apk/<arch>/.apk/<name>-<ver>/`), which the mirror serves as an immutable
   file because it can't be rebuilt byte for byte; and its unpacked data
   files (key `<sha1>`) at `/apk/<arch>/<name>-<ver>/`, usable as an overlay
-  layer, with no install scripts run and an `/.h9index`. The layer is built
+  layer, with no install scripts run and an `/.h9index`. Alpine rebuilds
+  some packages per branch without a version bump, so one name-version can
+  name several builds: the first one mounted keeps `<name>-<ver>`, later
+  ones mount at `<name>-<ver>@<first 12 hex of the SHA-1>` (`apk_mount`). The layer is built
   from the cached `.apk`, so upstream is hit once; `-apk-unpack` (on) builds
   it in the background after the mirror serves the `.apk`.
 - **Verified while streaming:** the control stream's SHA-1 must match the
