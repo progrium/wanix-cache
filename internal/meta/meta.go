@@ -122,7 +122,7 @@ type DB struct {
 
 // Open opens or creates the metadata database at path.
 func Open(path string) (*DB, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	dsn := "file:" + path + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate"
 	sdb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

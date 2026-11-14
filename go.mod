@@ -17,11 +17,13 @@ require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/perkeep/goexif v0.0.0-20261105220536-9c082a381f2f // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
+	github.com/ulikunitz/xz v0.5.17 // indirect
 	go4.org v0.0.0-20261028031214-ed6929a230fe // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect

@@ -53,6 +53,7 @@ func main() {
 		addr := fl.String("9p2000", "", "plain 9P2000 TCP listen address (no symlinks); empty to disable")
 		gib := fl.Int64("max-gib", 10, "cap on CAS + spool bytes, GiB; 0 = unlimited")
 		workers := fl.Int("ingest-workers", 4, "files ingested into the CAS concurrently")
+		addSubsystemFlags(fl)
 		fl.Parse(args)
 		err = serve(*data, *addrL, *addr, *gib<<30, *workers)
 	case "import":

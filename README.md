@@ -66,6 +66,34 @@ Imported trees appear at `/local/<key>`.
 - Unit keys must be stable and content-identifying (apk checksum, layer
   diff_id, store path hash), because refetching must produce the same tree.
 
+## Nix
+
+`internal/subsys/nix` reads Nix store paths through from binary caches
+(cache.nixos.org by default, `-nix-substituters` to change). No Nix is
+needed on the cache side.
+
+- `/nix/store/<hash>-<name>/` is one store path (unit key `<hash>-<name>`).
+  Looking it up fetches the narinfo, streams the NAR (xz, zstd, bzip2, gzip
+  or none), checks the NarHash over the stream, and unpacks it into the
+  spool and then the CAS, so files dedupe across paths and subsystems.
+- `/nix/closure/<hash>-<name>/` is the path's whole closure as a root:
+  `nix/store/<member>/...` for every path reachable through narinfo
+  References. Members are faulted in as their own units first.
+- `-nix-cache ADDR` serves a binary cache (`nix-cache-info`, `<hash>.narinfo`,
+  `nar/<hash>.nar`) with `Compression: none`. NARs are rebuilt from the tree
+  and match the upstream NarHash; upstream signatures pass through unchanged,
+  so a guest's Nix keeps verifying them. Use it as a substituter:
+  `nix copy --from http://HOST:PORT /nix/store/...` or
+  `--option substituters http://HOST:PORT`.
+- Eviction goes from the leaves inward (`subsys.EvictionOrderer`): a path is
+  a candidate only when no live path or closure refers to it.
+  `-nix-evict-delete` runs `nix-store --delete` first (`subsys.Evicter`).
+- Usage is per store path: the package name and version come from the store
+  name (`hello-2.12.1` is `hello`, `2.12.1`).
+- `WANIX_NIX_UPSTREAM=1 go test -run Upstream ./internal/subsys/nix` runs the
+  end-to-end check: a cold 9P read of `hello`, a closure read, and real
+  `nix copy` from the endpoint with signatures verified.
+
 ## Measurements (phase 1)
 
 - Lookup by `(parent, name)`: 7 µs at 1k entries, 12 µs at 100k entries

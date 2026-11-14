@@ -104,3 +104,13 @@ type Sink interface {
 	// upstream bytes, to be compared with Info.Digest.
 	Digest(d string)
 }
+
+// EvictionOrderer is optionally implemented by subsystems with their own
+// eviction order. The reclaimer passes a window of the subsystem's
+// evictable (resident, unpinned) units in LRU order and evicts only the
+// units returned, in the order returned; units left out are deferred to a
+// later round. Nix uses it to evict from the leaves inward: a store path
+// goes only once nothing live refers to it.
+type EvictionOrderer interface {
+	EvictionOrder(ctx context.Context, units []meta.Unit) ([]meta.Unit, error)
+}
