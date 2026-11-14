@@ -5,6 +5,7 @@
 //	wanix-cache index  [-data DIR] [-all] [ROOT...]
 //	wanix-cache stats  [-data DIR]
 //	wanix-cache units  [-data DIR] [-subsystem NAME]
+//	wanix-cache usage  [-data DIR] [-subsystem NAME] [-untouched] [-json]
 //	wanix-cache gc     [-data DIR] [-max-gib N] [-high F] [-low F]
 //	wanix-cache evict  [-data DIR] [-subsystem NAME] -key KEY
 //	wanix-cache refault [-data DIR] -key KEY SRC
@@ -45,6 +46,7 @@ commands:
   index    generate the /.h9index of roots (such as /local/alpine)
   stats    print store totals
   units    list units
+  usage    package, object and path usage; -untouched lists never-opened files
   gc       sweep unreferenced blobs and evict down to the low watermark
   evict    evict one unit now (its manifest stays; a read refaults it)
   refault  bring an evicted local unit back from its source directory
@@ -93,6 +95,8 @@ func main() {
 		sub := fl.String("subsystem", "", "only this subsystem")
 		fl.Parse(args)
 		err = units(*data, *sub)
+	case "usage":
+		err = usageCommand(fl, data, args)
 	case "gc", "evict", "refault", "audit", "pin":
 		err = gcCommand(cmd, fl, data, args)
 	default:
@@ -150,6 +154,9 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 	if err := startGC(db, store, mgr, quota, max); err != nil {
 		return err
 	}
+	if err := startUsage(context.Background(), db, mgr); err != nil {
+		return err
+	}
 	errc := make(chan error, 2)
 	if addrL != "" {
 		ln, err := net.Listen("tcp", addrL)
@@ -173,6 +180,7 @@ func serve(dir, addrL, addr string, max int64, workers int) error {
 	go func() {
 		<-sigs
 		mgr.Close() // spooled units are ingested on the next start
+		flushUsage()
 		db.Close()
 		os.Exit(0)
 	}()

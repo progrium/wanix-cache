@@ -27,7 +27,7 @@ func addAPKFlags(fl *flag.FlagSet) {
 }
 
 func registerAPK(ctx context.Context, m *fill.LocalManager) error {
-	a := apk.New(m.DB(), apk.Config{Upstream: apkFlags.upstream, IndexTTL: apkFlags.ttl, Unpack: apkFlags.unpack})
+	a := apk.New(m.DB(), apk.Config{Upstream: apkFlags.upstream, IndexTTL: apkFlags.ttl, Unpack: apkFlags.unpack, Indexer: rootIndexer})
 	if err := m.Register(ctx, a); err != nil {
 		return err
 	}

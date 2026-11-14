@@ -65,6 +65,10 @@ type Config struct {
 	// else in the cache. Off, layers are unpacked only when a path under
 	// /apk/<arch>/<name>-<ver>/ is looked up.
 	Unpack bool
+	// Indexer, if set, gets IndexRoot("/apk/<arch>/<name>-<ver>") when a
+	// package's unpacked layer has its full manifest, so H9 can mount the
+	// layer with a /.h9index.
+	Indexer subsys.RootIndexer
 	// Logf receives background errors. Default log.Printf.
 	Logf func(string, ...any)
 }
@@ -104,7 +108,29 @@ func New(db *meta.DB, cfg Config) *APK {
 
 // Attach gives the subsystem the manager it is registered with, which the
 // mirror and the unpacked units read raw .apk units through.
-func (a *APK) Attach(m fill.Manager) { a.mgr = m }
+func (a *APK) Attach(m fill.Manager) {
+	a.mgr = m
+	if a.cfg.Indexer != nil {
+		m.Watch(a.indexLayer)
+	}
+}
+
+// indexLayer indexes an unpacked layer once its manifest is complete.
+func (a *APK) indexLayer(ev fill.UnitEvent) {
+	if ev.Unit.Subsystem != Name || ev.To != meta.UnitSpooled || !a.DerivedUnit(subsys.Key(ev.Unit.Key)) {
+		return
+	}
+	go func() {
+		ctx := context.Background()
+		info, err := a.Describe(ctx, subsys.Key(ev.Unit.Key))
+		if err == nil {
+			err = a.cfg.Indexer.IndexRoot(ctx, "/"+Name+"/"+info.Mount)
+		}
+		if err != nil {
+			a.cfg.Logf("apk: indexing layer %s: %v", ev.Unit.Key, err)
+		}
+	}()
+}
 
 func (a *APK) Name() string { return Name }
 
@@ -324,7 +350,7 @@ func (a *APK) fetchRaw(ctx context.Context, pkg pkgRow, sink subsys.Sink) error 
 func (a *APK) fetchFiles(ctx context.Context, pkg pkgRow, sink subsys.Sink) error {
 	var r io.Reader
 	if a.mgr != nil {
-		f, in, err := a.mgr.OpenPath(ctx, Name, rawKey(pkg.SHA1), pkg.NV+".apk")
+		f, in, err := a.mgr.OpenPath(fill.Internal(ctx), Name, rawKey(pkg.SHA1), pkg.NV+".apk")
 		if err != nil {
 			return err
 		}

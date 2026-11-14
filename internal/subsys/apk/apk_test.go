@@ -16,7 +16,9 @@ import (
 
 	"github.com/progrium/wanix-cache/internal/cas"
 	"github.com/progrium/wanix-cache/internal/fill"
+	"github.com/progrium/wanix-cache/internal/h9index"
 	"github.com/progrium/wanix-cache/internal/meta"
+	"github.com/progrium/wanix-cache/internal/tree"
 )
 
 const repo = "v3.20/main/x86_64"
@@ -41,6 +43,9 @@ var busybox = (&fixturePkg{name: "busybox", version: "1.36.1-r29", arch: "x86_64
 type harness struct {
 	t      *testing.T
 	db     *meta.DB
+	store  *cas.Store
+	fs     *tree.FS
+	idx    *h9index.Store
 	mgr    *fill.LocalManager
 	apk    *APK
 	up     *upstream
@@ -70,12 +75,18 @@ func newHarness(t *testing.T, unpack bool) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{t: t, db: db, mgr: mgr, up: newUpstream(), clock: time.Unix(1_800_000_000, 0)}
+	h := &harness{t: t, db: db, store: store, mgr: mgr, up: newUpstream(), clock: time.Unix(1_800_000_000, 0)}
 	upSrv := httptest.NewServer(h.up)
 	h.up.set("/"+repo+"/APKINDEX.tar.gz", buildIndex(hello, busybox))
 	h.up.set("/"+repo+"/"+hello.nv()+".apk", hello.apk)
 	h.up.set("/"+repo+"/"+busybox.nv()+".apk", busybox.apk)
-	h.apk = New(db, Config{Upstream: upSrv.URL, Unpack: unpack, Logf: t.Logf})
+	idx, err := h9index.Open(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.fs = &tree.FS{Meta: db, CAS: store, Files: mgr, Faults: mgr, Index: idx}
+	h.idx = idx
+	h.apk = New(db, Config{Upstream: upSrv.URL, Unpack: unpack, Logf: t.Logf, Indexer: h.fs.Indexer(idx, "")})
 	h.apk.now = func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.clock }
 	if err := mgr.Register(ctx, h.apk); err != nil {
 		t.Fatal(err)
@@ -356,6 +367,17 @@ func TestOverlayLayer(t *testing.T) {
 	u, _ := h.db.Unit(ctx, Name, string(filesKey(hello.sha1hex())))
 	if u.State != meta.UnitResident || u.LogicalBytes != hello.installed {
 		t.Errorf("files unit: %+v, want resident with %d bytes", u, hello.installed)
+	}
+	// The layer root gets an /.h9index once its manifest is complete.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok, err := h.idx.Get(ctx, u.Root, h9index.DotL); err == nil && ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("layer root has no /.h9index")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	// Unknown names under /apk do not fault anything.
 	if _, err := walk("apk/x86_64/nope-1.0-r0"); !errors.Is(err, meta.ErrNotExist) {

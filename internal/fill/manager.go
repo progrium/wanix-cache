@@ -449,8 +449,9 @@ func (m *LocalManager) Open(ctx context.Context, in meta.Inode) (cas.File, error
 		release()
 		return nil, err
 	}
-	m.emitOpen(OpenEvent{Inode: in})
-	return &pinnedFile{File: f, m: m, in: in, release: release}, nil
+	internal := IsInternal(ctx)
+	m.emitOpen(OpenEvent{Inode: in, Internal: internal})
+	return &pinnedFile{File: f, m: m, in: in, release: release, internal: internal}, nil
 }
 
 // OpenPath implements Manager.
@@ -556,11 +557,12 @@ func (m *LocalManager) waitChange(ctx context.Context, ino uint64, f *flight) er
 
 type pinnedFile struct {
 	cas.File
-	m       *LocalManager
-	in      meta.Inode
-	read    atomic.Int64
-	once    sync.Once
-	release func()
+	m        *LocalManager
+	in       meta.Inode
+	read     atomic.Int64
+	once     sync.Once
+	release  func()
+	internal bool
 }
 
 func (p *pinnedFile) ReadAt(b []byte, off int64) (int, error) {
@@ -573,7 +575,7 @@ func (p *pinnedFile) Close() error {
 	err := p.File.Close()
 	p.once.Do(func() {
 		p.release()
-		p.m.emitOpen(OpenEvent{Inode: p.in, Closed: true, BytesRead: p.read.Load()})
+		p.m.emitOpen(OpenEvent{Inode: p.in, Closed: true, BytesRead: p.read.Load(), Internal: p.internal})
 	})
 	return err
 }

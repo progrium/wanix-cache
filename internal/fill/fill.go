@@ -90,6 +90,24 @@ type OpenEvent struct {
 	Inode     meta.Inode
 	Closed    bool
 	BytesRead int64
+	// Internal is set for opens made with a context from Internal: the
+	// cache reading its own units (an apk layer unpacked from the cached
+	// .apk), not a client. Usage stats skip them.
+	Internal bool
+}
+
+type internalKey struct{}
+
+// Internal marks ctx for opens the cache makes for itself, so their
+// OpenEvents carry Internal.
+func Internal(ctx context.Context) context.Context {
+	return context.WithValue(ctx, internalKey{}, true)
+}
+
+// IsInternal reports whether ctx was marked by Internal.
+func IsInternal(ctx context.Context) bool {
+	v, _ := ctx.Value(internalKey{}).(bool)
+	return v
 }
 
 // Reclaimer frees CAS bytes by evicting units. The Manager calls it when a
