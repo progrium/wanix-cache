@@ -28,6 +28,7 @@ const (
 	KindDir Kind = iota + 1
 	KindFile
 	KindSymlink
+	KindWhiteout // OCI: hides the same name in lower layers
 )
 
 func (k Kind) String() string {
@@ -38,6 +39,8 @@ func (k Kind) String() string {
 		return "file"
 	case KindSymlink:
 		return "symlink"
+	case KindWhiteout:
+		return "whiteout"
 	}
 	return fmt.Sprintf("kind(%d)", uint8(k))
 }
@@ -55,6 +58,7 @@ type Inode struct {
 	Target  string // symlink target
 	Parent  uint64 // directories only
 	Unit    int64  // owning unit; 0 for namespace scaffolding
+	Flags   uint32 // FlagOpaque, ...
 }
 
 // Dirent is a named entry in a directory listing.
@@ -127,13 +131,17 @@ func Open(path string) (*DB, error) {
 		sdb.Close()
 		return nil, fmt.Errorf("meta: schema: %w", err)
 	}
+	if err := (&DB{db: sdb}).Migrate(context.Background(), "core", coreMigrations); err != nil {
+		sdb.Close()
+		return nil, err
+	}
 	d := &DB{db: sdb}
 	if _, err := sdb.Exec(`INSERT OR IGNORE INTO inode (ino, kind, mode, mtime, parent) VALUES (?, ?, ?, ?, ?)`,
 		RootIno, KindDir, 0o555, time.Now().UnixNano(), RootIno); err != nil {
 		sdb.Close()
 		return nil, err
 	}
-	const cols = `i.ino, i.kind, i.mode, i.size, i.mtime, i.content, i.target, i.parent, i.unit`
+	const cols = `i.ino, i.kind, i.mode, i.size, i.mtime, i.content, i.target, i.parent, i.unit, i.flags`
 	if d.getInode, err = sdb.Prepare(`SELECT ` + cols + ` FROM inode i WHERE i.ino = ?`); err != nil {
 		sdb.Close()
 		return nil, err
@@ -153,7 +161,7 @@ func scanInode(s scanner, extra ...any) (Inode, error) {
 	var in Inode
 	var mode uint32
 	var mtime int64
-	dst := append(extra, &in.Ino, &in.Kind, &mode, &in.Size, &mtime, &in.Content, &in.Target, &in.Parent, &in.Unit)
+	dst := append(extra, &in.Ino, &in.Kind, &mode, &in.Size, &mtime, &in.Content, &in.Target, &in.Parent, &in.Unit, &in.Flags)
 	if err := s.Scan(dst...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return in, ErrNotExist
@@ -178,7 +186,7 @@ func (d *DB) Lookup(ctx context.Context, parent uint64, name string) (Inode, err
 // ReadDir lists up to limit entries of directory dir whose names sort after
 // the given name ("" starts at the beginning), in name order.
 func (d *DB) ReadDir(ctx context.Context, dir uint64, after string, limit int) ([]Dirent, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT d.name, i.ino, i.kind, i.mode, i.size, i.mtime, i.content, i.target, i.parent, i.unit
+	rows, err := d.db.QueryContext(ctx, `SELECT d.name, i.ino, i.kind, i.mode, i.size, i.mtime, i.content, i.target, i.parent, i.unit, i.flags
 		FROM dirent d JOIN inode i ON i.ino = d.ino
 		WHERE d.parent = ? AND d.name > ? ORDER BY d.name LIMIT ?`, dir, after, limit)
 	if err != nil {
@@ -223,7 +231,7 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 // skip entries in name order. It serves clients whose directory cursors are
 // positions rather than names (9P2000.L readdir offsets).
 func (d *DB) ReadDirAt(ctx context.Context, dir uint64, skip uint64, limit int) ([]Dirent, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT d.name, i.ino, i.kind, i.mode, i.size, i.mtime, i.content, i.target, i.parent, i.unit
+	rows, err := d.db.QueryContext(ctx, `SELECT d.name, i.ino, i.kind, i.mode, i.size, i.mtime, i.content, i.target, i.parent, i.unit, i.flags
 		FROM dirent d JOIN inode i ON i.ino = d.ino
 		WHERE d.parent = ? ORDER BY d.name LIMIT ? OFFSET ?`, dir, limit, skip)
 	if err != nil {

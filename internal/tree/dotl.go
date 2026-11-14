@@ -111,6 +111,9 @@ func (n *lnode) Walk(names []string) ([]p9.QID, p9.File, error) {
 		if err != nil {
 			return nil, nil, errno(err)
 		}
+		if next.Kind == meta.KindWhiteout {
+			return nil, nil, linux.ENOENT
+		}
 		cur = next
 		qids = append(qids, lqid(cur))
 	}
@@ -231,18 +234,30 @@ func (n *lnode) Readdir(offset uint64, count uint32) (p9.Dirents, error) {
 	if err != nil {
 		return nil, linux.EIO
 	}
+	// Offsets are positions in the full listing, hidden entries included,
+	// so a cursor stays valid whatever is skipped.
 	out := make(p9.Dirents, 0, len(des))
-	size := 0
-	for _, de := range des {
-		size += direntFixed + len(de.Name)
-		if size > int(count) {
-			break
+	size, used := 0, 0
+	for i, de := range des {
+		if de.Kind != meta.KindWhiteout {
+			size += direntFixed + len(de.Name)
+			if size > int(count) {
+				break
+			}
+			q := lqid(de.Inode)
+			out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: de.Name, Offset: offset + uint64(i) + 1})
 		}
-		q := lqid(de.Inode)
-		out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: de.Name, Offset: offset + uint64(len(out)) + 1})
+		used = i + 1
 	}
-	if len(out) > 0 {
-		n.lastOff, n.lastName = offset+uint64(len(out)), out[len(out)-1].Name
+	if used > 0 {
+		n.lastOff, n.lastName = offset+uint64(used), des[used-1].Name
+	}
+	if len(out) == 0 && used == limit {
+		// A whole page of hidden entries: an empty reply would end the
+		// listing, so read on.
+		n.mu.Unlock()
+		defer n.mu.Lock()
+		return n.Readdir(offset+uint64(used), count)
 	}
 	return out, nil
 }

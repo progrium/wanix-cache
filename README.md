@@ -19,6 +19,8 @@ the debug savings mode, and the subsystems come in later phases.
 | `internal/tree` | The namespace with bytes from the CAS: the 9P2000.L server (`dotl.go`) and the adapter for the plain 9P2000 server |
 | `internal/ninep` | A small read-only 9P2000 server |
 | `internal/ingest` | Imports a local directory as a unit (stand-in for subsystem fetchers) |
+| `internal/subsys` | The `Subsystem` interface each subsystem implements, and the conventions below |
+| `internal/fill` | The fill-path API: unit manager, spool, quota, reclaimer hook (implementation in progress) |
 | `cmd/wanix-cache` | `serve`, `import`, `stats`, `units` |
 
 ## Try it
@@ -47,6 +49,22 @@ Imported trees appear at `/local/<key>`.
 - **Symlinks** are stored for every subsystem. 9P2000.L serves them; plain
   9P2000 has no way to, so that server hides them.
 - **Read-only.** All client writes fail with EROFS. Only the cache writes.
+
+## Subsystem conventions
+
+- One package per subsystem: `internal/subsys/apk`, `internal/subsys/oci`,
+  `internal/subsys/nix`. Its `Name()` is that word, its namespace root
+  (`/<name>/`), and the `subsystem` column on units.
+- Its own tables are named `<name>_<table>` (`apk_index`). It never writes the
+  core tables (`inode`, `dirent`, `unit`, `content`) directly; it goes
+  through `subsys.Sink` and `fill.Manager`.
+- Schema changes are numbered `meta.Migration`s returned by `Migrations()`,
+  applied by `meta.Migrate` and recorded per owner in `schema_migrations`.
+  Versions are 1..n, and a merged migration is never edited or renumbered:
+  a change is always a new version. Core migrations live in
+  `internal/meta/migrate.go` under owner `core`.
+- Unit keys must be stable and content-identifying (apk checksum, layer
+  diff_id, store path hash), because refetching must produce the same tree.
 
 ## Measurements (phase 1)
 

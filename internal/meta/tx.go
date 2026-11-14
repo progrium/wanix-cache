@@ -188,3 +188,14 @@ func (d *DB) ContentRef(ctx context.Context, digest string) (string, bool, error
 	}
 	return ref, err == nil, err
 }
+
+// Whiteout records that name in parent hides lower layers' entries.
+func (t *Tx) Whiteout(parent uint64, name string, unit int64) (uint64, error) {
+	return t.create(parent, name, Inode{Kind: KindWhiteout, Unit: unit})
+}
+
+// SetFlags replaces an inode's flags, for example FlagOpaque on a directory.
+func (t *Tx) SetFlags(ino uint64, flags uint32) error {
+	_, err := t.tx.ExecContext(t.ctx, `UPDATE inode SET flags = ? WHERE ino = ?`, flags, ino)
+	return err
+}
