@@ -125,7 +125,7 @@ reads reach the cache.
   `h9index`, its own migrations), keyed by root directory and variant, and
   pinned to that directory's mtime and unit so a reused inode never serves
   another tree's index. The file is a synthetic `0444` entry in the root,
-  listed by both servers, with qid.path `dir | 1<<63` (`| 1<<62` for .L),
+  listed by both servers (the .L server lists it after every real entry, at a fixed offset, so real offsets never shift), with qid.path `dir | 1<<63` (`| 1<<62` for .L),
   qid.vers the FNV-32a of the text, and mtime the time the text last
   changed. Regenerating an unchanged tree changes nothing, so h9's host cache
   keeps hitting. A generated index shadows a `.h9index` shipped in the tree.

@@ -264,48 +264,48 @@ func (n *lnode) ReadAt(p []byte, off int64) (int, error) {
 	return nr, err
 }
 
+// indexOffset is the readdir offset of a root's /.h9index, which is listed
+// after every real entry. Real entries' offsets are their positions, so
+// they stay the same whether or not the directory has an index, even if
+// one is generated in the middle of a listing.
+const indexOffset = 1 << 62
+
 func (n *lnode) Readdir(offset uint64, count uint32) (p9.Dirents, error) {
 	if n.in.Kind != meta.KindDir {
 		return nil, linux.ENOTDIR
+	}
+	if offset >= indexOffset {
+		return nil, nil
 	}
 	ctx := context.Background()
 	if n.fs.isSynthDir(n.in.Ino) {
 		return n.synthReaddir(ctx, offset, count)
 	}
-	// An indexed directory lists its /.h9index first, at offset 0, so the
-	// real entries' offsets are their positions plus one. 9P2000.L
-	// readdir has no order to keep.
-	var out p9.Dirents
-	var shift uint64
 	idx, indexed, err := n.indexNode(ctx, n.in.Ino)
 	if err != nil {
 		return nil, linux.EIO
 	}
-	const direntFixed = 13 + 8 + 1 + 2
-	if indexed {
-		shift = 1
-		if offset == 0 {
-			if int(count) < direntFixed+len(h9index.Name) {
-				return nil, nil
-			}
-			q := idx.qid()
-			out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: h9index.Name, Offset: 1})
-			count -= uint32(direntFixed + len(h9index.Name))
-			offset = 1
-		}
+	out, done, used, err := n.readdir(ctx, offset, count, indexed)
+	if err != nil || !done || !indexed {
+		return out, err
 	}
-	rest, err := n.readdir(ctx, offset-shift, count, shift, indexed)
-	return append(out, rest...), err
+	if used+direntFixed+len(h9index.Name) > int(count) {
+		return out, nil // the next call, from the last offset, lists it
+	}
+	q := idx.qid()
+	return append(out, p9.Dirent{QID: q, Type: q.Type, Name: h9index.Name, Offset: indexOffset}), nil
 }
 
-// readdir lists real entries from position offset; served offsets are
-// positions plus shift.
-func (n *lnode) readdir(ctx context.Context, offset uint64, count uint32, shift uint64, hideIndex bool) (p9.Dirents, error) {
+// direntFixed is an encoded dirent's size without its name: a 13-byte
+// qid, an 8-byte offset, a type byte and a 2-byte name length.
+const direntFixed = 13 + 8 + 1 + 2
+
+// readdir lists real entries from position offset. It reports whether it
+// reached the end of the listing and how many reply bytes it used.
+func (n *lnode) readdir(ctx context.Context, offset uint64, count uint32, hideIndex bool) (p9.Dirents, bool, int, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	// count is the reply size in bytes. An encoded dirent is a 13-byte qid,
-	// an 8-byte offset, a type byte and a 2-byte name length, plus the name.
-	const direntFixed = 13 + 8 + 1 + 2
+	// count is the reply size in bytes.
 	limit := int(count)/direntFixed + 1
 	if limit > 1024 {
 		limit = 1024
@@ -327,7 +327,7 @@ func (n *lnode) readdir(ctx context.Context, offset uint64, count uint32, shift 
 		des, err = n.fs.Meta.ReadDirAt(ctx, n.in.Ino, offset, limit)
 	}
 	if err != nil {
-		return nil, linux.EIO
+		return nil, false, 0, linux.EIO
 	}
 	// Offsets are positions in the full listing, hidden entries included,
 	// so a cursor stays valid whatever is skipped.
@@ -335,26 +335,27 @@ func (n *lnode) readdir(ctx context.Context, offset uint64, count uint32, shift 
 	size, used := 0, 0
 	for i, de := range des {
 		if lvisible(de.Inode) && !(hideIndex && de.Name == h9index.Name) {
-			size += direntFixed + len(de.Name)
-			if size > int(count) {
+			if size+direntFixed+len(de.Name) > int(count) {
 				break
 			}
+			size += direntFixed + len(de.Name)
 			q := lqid(de.Inode)
-			out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: de.Name, Offset: offset + uint64(i) + 1 + shift})
+			out = append(out, p9.Dirent{QID: q, Type: q.Type, Name: de.Name, Offset: offset + uint64(i) + 1})
 		}
 		used = i + 1
 	}
 	if used > 0 {
 		n.lastOff, n.lastName = offset+uint64(used), des[used-1].Name
 	}
+	done := used == len(des) && len(des) < limit
 	if len(out) == 0 && used == limit {
 		// A whole page of hidden entries: an empty reply would end the
 		// listing, so read on.
 		n.mu.Unlock()
 		defer n.mu.Lock()
-		return n.readdir(ctx, offset+uint64(used), count, shift, hideIndex)
+		return n.readdir(ctx, offset+uint64(used), count, hideIndex)
 	}
-	return out, nil
+	return out, done, size, nil
 }
 
 func (n *lnode) Readlink() (string, error) {

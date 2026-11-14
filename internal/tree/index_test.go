@@ -343,7 +343,7 @@ func TestIndexOverDotL(t *testing.T) {
 		t.Error("variants share a qid")
 	}
 
-	// Readdir lists the index once, first, and every real entry after it.
+	// Readdir lists every real entry, then the index once, last.
 	if _, _, err := root.Open(p9.ReadOnly); err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestIndexOverDotL(t *testing.T) {
 		}
 	}
 	got := strings.Join(names, ",")
-	if want := ".h9index,a,a-b,bin,docs,etc,tmp"; got != want {
+	if want := "a,a-b,bin,docs,etc,tmp,.h9index"; got != want {
 		t.Errorf("readdir %s, want %s", got, want)
 	}
 }

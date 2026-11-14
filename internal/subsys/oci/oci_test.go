@@ -197,7 +197,13 @@ func TestMergedRootfs(t *testing.T) {
 
 	check := func(p string, want ...string) {
 		t.Helper()
-		got := e.ls(t, r+p)
+		var got []string
+		for _, n := range e.ls(t, r+p) {
+			if p == "/" && n == h9index.Name {
+				continue // generated once the layers finish; checked below
+			}
+			got = append(got, n)
+		}
 		sort.Strings(want)
 		if strings.Join(got, " ") != strings.Join(want, " ") {
 			t.Errorf("ls %s = %v, want %v", p, got, want)
