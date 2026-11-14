@@ -27,6 +27,7 @@ the debug savings mode, and the subsystems come in later phases.
 | `internal/savings` | Debug savings mode: disk vs CAS savings per subsystem (`/.cache/stats`, `wanix-cache stats`) |
 | `internal/h9index` | Generates, stores and serves each root's `/.h9index` (hyper9's mount-index) from metadata |
 | `internal/gc` | Eviction and blob GC: global refcounts, LRU with watermarks, pins, sweep, audit |
+| `bench` | Phase 2 read benchmark: CAS against plain disk, direct and over both 9P servers (`bench/cmd/readbench`); findings in [`bench/RESULTS.md`](bench/RESULTS.md) |
 | `cmd/wanix-cache` | `serve`, `import`, `index`, `stats`, `units`, `usage`, `gc`, `evict`, `refault`, `audit`, `pin` |
 
 ## Try it
